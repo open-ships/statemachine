@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      # The remaining checks are properties of the source, not of the platform,
+      # so one runner proves them. They also assume a POSIX shell.
+      - name: Verify zero dependencies
+        if: runner.os == 'Linux'
+        run: |
+          test ! -f go.sum || (echo "go.sum exists; this module must have zero dependencies" && exit 1)
+
+      - name: Formatting
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)"
+
+      - name: Race detector
+        if: runner.os == 'Linux'
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Benchmarks
+        if: runner.os == 'Linux'
+        run: go test -run=NONE -bench=. -benchtime=10x ./...

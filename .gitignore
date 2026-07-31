@@ -1,0 +1,9 @@
+# Test & coverage output
+*.test
+*.out
+coverage.*
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
