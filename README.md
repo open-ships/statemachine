@@ -10,24 +10,23 @@ import "github.com/open-ships/statemachine"
 
 ## The idea
 
-A finite state machine is a partial function from `(state, event)` to `state`. This package is that
-function and nothing else.
+A finite state machine is a partial function from `(state, event)` to `state`. This package keeps
+that function as its core and builds optional state owners around it.
 
-**The machine does not hold the current state.** State is a value you own — a struct field, a
-database column — and a step is the application of the machine to that value:
+**A `Machine` does not hold the current state.** It is an immutable compiled definition. State can
+remain a value you own — a struct field, a database column — and a step is the application of the
+definition to that value:
 
 ```go
 order.State, err = orders.Fire(ctx, order.State, Pay, cmd)
 ```
 
-Everything else follows from that one decision. Because the library owns no state, restoring a
-machine from a database row, running a million of them from one table, using one from many
-goroutines, and firing one from inside another need no support from the package — they are ordinary
-Go. There is no `Current`, no `SetState`, no metadata bag, no internal mutex, no in-transition error,
-no deferred-transition protocol, and no observer registry, because there is no state inside the
-library for any of them to manage.
-
-The whole API is **12 exported identifiers**.
+One definition can serve a million aggregates and any number of goroutines. When the package should
+own execution state instead, construct one `Instance` per aggregate. The [`queued`](queued) package
+adds serialized run-to-completion execution, [`persist`](persist) runs the flat definition inside an
+adapter-owned unit of work, and [`statechart`](statechart) supplies hierarchy and lifecycle actions.
+A transactional `persist.Store` can pass its transaction through to effects. These modules remain
+separate because they have different concurrency and failure semantics.
 
 ## Hello world
 
@@ -90,8 +89,9 @@ errors.Is(err, ErrWindowClosed)              // true: and this is why        -> 
 
 That is the whole 409-versus-422 story, with no second error type and no `errors.As`.
 
-**Effects fail with `return err`.** The state advances if and only if `Do` returned `nil`, and the
-error comes back to you unwrapped, so `errors.Is` against your own sentinels works with no ceremony:
+**Effects fail with `return err`.** `Fire` reports the destination if and only if `Do` returned `nil`,
+and the error comes back to you unwrapped, so `errors.Is` against your own sentinels works with no
+ceremony:
 
 ```go
 {From: Pending, Event: Pay, To: Paid, Do: func(ctx context.Context, c *Cmd) error {
@@ -108,7 +108,7 @@ for event, to := range orders.Permitted(ctx, o.State, cmd) {
 }
 ```
 
-## The API
+## Interface
 
 | | |
 |---|---|
@@ -120,21 +120,54 @@ for event, to := range orders.Permitted(ctx, o.State, cmd) {
 | `Machine.Permitted(ctx, from, data)` | iterate the events accepted now, each with its destination |
 | `ErrNotPermitted` | the sentinel every refusal wraps |
 
+The optional state-owning interface adds:
+
+| | |
+|---|---|
+| `NewInstance(machine, initial)` | create one fail-fast, in-memory execution |
+| `Instance.State()` | read its last committed state |
+| `Instance.Fire(ctx, event, data)` | apply one event without passing the state |
+| `Instance.Permitted(ctx, data)` | eagerly snapshot its current affordances |
+| `ErrInFlight` | another fire is already executing on that instance |
+
 `T` is the value handed to every `Guard` and `Do` — your aggregate, plus whatever this command needs.
 It is passed to `Fire` rather than stored, so one immutable `Machine` serves every request while
 still seeing request-scoped values. A machine with nothing to carry uses `struct{}`.
 
-Visualization, reachability checking, `Current`/`SetState`, observer hooks, and per-state entry
-actions are deliberately absent: the table is exported data you wrote and kept, and reading it is
-ordinary Go. Each is a few lines, in your dialect rather than this package's, and each has a runnable
-version in [`example_test.go`](example_test.go). The reasoning for every omission — including the one
-genuinely uncomfortable cut, per-state entry actions — is in the [package
-documentation](https://pkg.go.dev/github.com/open-ships/statemachine).
+Visualization and reachability checking remain ordinary loops over the flat table. Per-state entry
+and exit actions do not belong to a flat `Machine`; use the `statechart` package when those semantics
+are required. Runnable flat-machine examples are in [`example_test.go`](example_test.go).
+
+## Choosing an execution model
+
+| Need | Module | State and concurrency semantics |
+|---|---|---|
+| Database aggregate or explicit assignment | `Machine` | caller-owned |
+| One in-memory aggregate | `Instance` | owned state; overlapping fire fails fast |
+| Follow-up events and FIFO serialization | `queued.Runtime` | owned state; each root run drains to completion |
+| Database state and outbox work | `persist.Fire` | transactional when the Store supplies a transaction; never auto-retried |
+| Hierarchy, initial substates, entry/exit, reentry | `statechart` | immutable chart plus one stateful instance per aggregate |
+
+A queued callback schedules same-runtime follow-ups with `queued.Enqueue` and the context it was
+given. It must never synchronously call `Runtime.Fire`; replacing that context defeats deadlock
+detection.
 
 ## Hazards
 
-**Discarding `Fire`'s result is never correct.** The effect has already run, and neither the compiler
-nor `go vet` reports the lost transition.
+**Discarding `Machine.Fire`'s returned state is never correct.** The effect has already run, and
+neither the compiler nor `go vet` reports the lost transition. A state-owning `Instance.Fire` may
+discard its returned state, but its error still must be handled.
+
+An `Instance` or queued runtime is the sole owner of its state. Do not also keep an authoritative
+copy in the value passed as `T`. Effects can still be partial: the state owner guarantees its state
+transition, not rollback of arbitrary I/O. Its synchronization protects the owned state, not other
+mutable fields inside `T`.
+
+For persistence, a getter and setter are not a transaction. A `persist.Store` must use a conditional
+write and must invoke the transition callback exactly once after a successful load. A transactional
+database Store should put aggregate changes and an outbox record in the same unit of work. Only work
+performed through that transaction is atomic. A conflict discovered after an effect is not retried;
+an application retry must reload and use a stable idempotency key.
 
 The rest — guard purity, how `ErrNotPermitted` propagates through nested machines, why `S` and `E`
 must be strictly comparable, and why generated tables want `Compile` rather than `MustCompile` — are
@@ -143,9 +176,10 @@ documented in full on
 
 ## Performance
 
-Apple M1 Pro, Go 1.26, measured with `testing.B.Loop`. Nothing on a successful path allocates:
-`Fire` is a map lookup, a guard call and a return, and `Permitted`'s iterator stays on the stack. A
-refusal allocates only the error.
+Apple M1 Pro, Go 1.26, measured with `testing.B.Loop`. Nothing on the flat `Machine`'s successful
+path allocates: `Fire` is a map lookup, a guard call and a return, and `Permitted`'s lazy iterator
+stays on the stack. A refusal allocates only the error. The state-owning modules intentionally add
+synchronization and, where required, eager snapshots or queued work.
 
 ```
 BenchmarkFireAccepted-10      60591013    21.32 ns/op     0 B/op    0 allocs/op
@@ -162,12 +196,12 @@ improvement and the reason this module requires it.
 
 ## Prior art
 
-Semi-inspired by [looplab/fsm](https://github.com/looplab/fsm), and distilled from it. The main
-departures: states and events are typed rather than strings; callbacks are fields on a row rather
-than a `map[string]Callback` keyed by magic strings like `"before_open"`; guards and effects return
-`error` rather than calling `Event.Cancel`; payloads are a type parameter rather than
-`...interface{}`; and the machine does not hold the current state, which is what removes most of the
-rest.
+Semi-inspired by [looplab/fsm](https://github.com/looplab/fsm), and distilled from it. The flat
+Machine's main departures: states and events are typed rather than strings; callbacks are fields on
+a row rather than a `map[string]Callback` keyed by magic strings like `"before_open"`; guards and
+effects return `error` rather than calling `Event.Cancel`; payloads are a type parameter rather than
+`...interface{}`; and the immutable definition does not hold current state. `Instance`, `queued`,
+`persist`, and `statechart` add stateful execution without changing that definition.
 
 Requires Go 1.26, which is what keeps `Permitted` allocation-free.
 

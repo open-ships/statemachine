@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"sync"
 
 	"github.com/open-ships/statemachine"
 )
@@ -68,8 +67,9 @@ const (
 	Refund  Event = "refund"
 )
 
-// Order is the aggregate. State is an ordinary field: there is nothing to
-// restore on start-up, because the machine was never holding it.
+// Order is the aggregate used by the caller-owned Machine examples. In that
+// execution model State is an ordinary field: restoration means loading it and
+// passing it to Fire.
 type Order struct {
 	ID      string
 	State   State
@@ -94,7 +94,8 @@ var (
 	ErrWindowClosed = errors.New("return window has closed")
 	ErrDeclined     = errors.New("card declined")
 
-	// errNotStocked routes to the backorder arm; its reason never surfaces.
+	// errNotStocked routes Paid+Ship to the backorder arm. In a state without
+	// a fallback Ship row, the same reason would surface with the refusal.
 	errNotStocked = errors.New("out of stock")
 )
 
@@ -367,60 +368,101 @@ func Example_entryAction() {
 }
 
 // Generated rows are input, not program text, so they go through Compile rather
-// than MustCompile: a table assembled in a loop can collide with a row that is
-// already there, and MustCompile would take the process down at import time.
+// than MustCompile. A transform must also preserve Compile's ordering rule: do
+// not append a generated default after a default that is already present.
 func Example_fanIn() {
 	rows := slices.Clone(orderTable)
-	for _, from := range []State{Draft, Pending, Paid, Backordered} {
-		rows = append(rows, Row{From: from, Event: Cancel, To: Cancelled})
+	type key struct {
+		from  State
+		event Event
+	}
+	declared := make(map[key]bool, len(rows))
+	for _, row := range rows {
+		declared[key{row.From, row.Event}] = true
+	}
+	for _, from := range []State{Draft, Pending, Paid, Backordered, Shipped} {
+		if !declared[key{from, Cancel}] {
+			rows = append(rows, Row{From: from, Event: Cancel, To: Cancelled})
+		}
 	}
 
-	if _, err := statemachine.Compile(rows); err != nil {
-		fmt.Println("rejected:", err)
+	machine, err := statemachine.Compile(rows)
+	if err != nil {
+		fmt.Println("compile:", err)
+		return
 	}
+	next, err := machine.Fire(context.Background(), Shipped, Cancel, &Cmd{})
+	fmt.Println(Shipped, "->", next, err)
 
 	// Output:
-	// rejected: statemachine: transitions[11] (draft on cancel) is unreachable: transitions[1] has the same From and Event and no Guard
+	// shipped -> cancelled <nil>
 }
 
-// If you prefer a method to an assignment, hold the state in your own type. The
-// lock is then yours, where it also protects the rest of the object — which a
-// lock inside the library never could.
-//
-// The mutex is not reentrant: an effect that calls back through Cart.Fire
-// deadlocks. Effects must act on the data they are given.
-type Cart struct {
-	mu    sync.Mutex
-	order Order
-}
-
-func (c *Cart) Fire(ctx context.Context, event Event, card string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	next, err := lifecycle.Fire(ctx, c.order.State, event, &Cmd{Order: &c.order, Card: card})
-	c.order.State = next
-	return err
-}
-
-// Actions collects under the same lock: Permitted is lazy, so the iterator must
-// not outlive the synchronization that protects the data its guards read.
-func (c *Cart) Actions(ctx context.Context) []Event {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var out []Event
-	for event := range lifecycle.Permitted(ctx, c.order.State, &Cmd{Order: &c.order}) {
-		out = append(out, event)
+// An Instance owns one aggregate's state. It centralizes synchronization,
+// commit-after-effect ordering, overlap rejection, and eager affordance
+// snapshots while the immutable Machine remains shared.
+func ExampleInstance() {
+	type Cart struct {
+		Lines   int
+		InStock bool
+		Charged bool
 	}
-	return out
-}
+	type Command struct {
+		Cart *Cart
+		Card string
+	}
+	type InstanceRow = statemachine.Transition[State, Event, *Command]
 
-func Example_statefulFacade() {
+	machine := statemachine.MustCompile([]InstanceRow{
+		{
+			From: Draft, Event: Submit, To: Pending,
+			Guard: func(_ context.Context, command *Command) error {
+				if command.Cart.Lines == 0 {
+					return ErrNoLines
+				}
+				return nil
+			},
+		},
+		{
+			From: Pending, Event: Pay, To: Paid,
+			Do: func(_ context.Context, command *Command) error {
+				if command.Card == "" {
+					return ErrDeclined
+				}
+				command.Cart.Charged = true
+				return nil
+			},
+		},
+		{
+			From: Paid, Event: Ship, To: Shipped,
+			Guard: func(_ context.Context, command *Command) error {
+				if !command.Cart.InStock {
+					return errNotStocked
+				}
+				return nil
+			},
+		},
+		{From: Paid, Event: Ship, To: Backordered},
+		{From: Paid, Event: Cancel, To: Refunded},
+	})
+
 	ctx := context.Background()
-	cart := &Cart{order: Order{State: Draft, Lines: 1, InStock: true}}
+	cart := &Cart{Lines: 1, InStock: true}
+	instance := statemachine.NewInstance(machine, Draft)
 
-	fmt.Println(cart.Fire(ctx, Submit, ""))
-	fmt.Println(cart.Fire(ctx, Pay, "4242"))
-	fmt.Println(cart.order.State, cart.Actions(ctx))
+	_, err := instance.Fire(ctx, Submit, &Command{Cart: cart})
+	fmt.Println(err)
+	_, err = instance.Fire(ctx, Pay, &Command{Cart: cart, Card: "4242"})
+	fmt.Println(err)
+
+	// Permitted runs all guards before returning, so the snapshot is safe to
+	// collect later. State lives only in instance; neither Cart nor Command
+	// contains a second copy.
+	var actions []Event
+	for event := range instance.Permitted(ctx, &Command{Cart: cart}) {
+		actions = append(actions, event)
+	}
+	fmt.Println(instance.State(), actions)
 
 	// Output:
 	// <nil>
