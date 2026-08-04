@@ -87,6 +87,68 @@ func TestFireWithNilMachineUsesZeroMachine(t *testing.T) {
 	}
 }
 
+func TestStepDistinguishesAttemptFromConfirmedCommit(t *testing.T) {
+	t.Run("confirmed", func(t *testing.T) {
+		store := persist.NewMemoryStore(map[string]state{"A": draft})
+		result, err := persist.Step(
+			context.Background(), store, "A", machine(nil), pay,
+			func(unit persist.MemoryUnit[string]) *command { return &command{tx: &tx{}} },
+		)
+		if err != nil || !result.Attempted || !result.Confirmed ||
+			result.From != draft || result.To != paid || result.Event != pay || result.TransitionError != nil {
+			t.Fatalf("Step = %+v, %v", result, err)
+		}
+	})
+
+	t.Run("transition error", func(t *testing.T) {
+		sentinel := errors.New("declined")
+		store := persist.NewMemoryStore(map[string]state{"A": draft})
+		result, err := persist.Step(
+			context.Background(), store, "A", machine(func(context.Context, *command) error { return sentinel }), pay,
+			func(persist.MemoryUnit[string]) *command { return &command{} },
+		)
+		if err != sentinel || !result.Attempted || result.Confirmed ||
+			result.From != draft || result.To != draft || result.TransitionError != sentinel {
+			t.Fatalf("Step = %+v, %v", result, err)
+		}
+	})
+
+	t.Run("store failure before attempt", func(t *testing.T) {
+		sentinel := errors.New("load failed")
+		store := persist.FuncStore[string, state, *tx]{
+			UpdateFunc: func(context.Context, string, func(context.Context, state, *tx) (state, error)) (state, error) {
+				return draft, sentinel
+			},
+		}
+		result, err := persist.Step(
+			context.Background(), store, "A", machine(nil), pay,
+			func(*tx) *command { return &command{} },
+		)
+		if err != sentinel || result.Attempted || result.Confirmed {
+			t.Fatalf("Step = %+v, %v", result, err)
+		}
+	})
+
+	t.Run("store failure after successful attempt", func(t *testing.T) {
+		store := persist.FuncStore[string, state, *tx]{
+			UpdateFunc: func(ctx context.Context, _ string, step func(context.Context, state, *tx) (state, error)) (state, error) {
+				if _, err := step(ctx, draft, &tx{}); err != nil {
+					t.Fatal(err)
+				}
+				return draft, persist.ErrConflict
+			},
+		}
+		result, err := persist.Step(
+			context.Background(), store, "A", machine(nil), pay,
+			func(*tx) *command { return &command{} },
+		)
+		if !errors.Is(err, persist.ErrConflict) || !result.Attempted || result.Confirmed ||
+			result.From != draft || result.To != paid || result.TransitionError != nil {
+			t.Fatalf("Step = %+v, %v", result, err)
+		}
+	})
+}
+
 func TestMemoryStoreConflictRunsEachCallbackOnce(t *testing.T) {
 	store := persist.NewMemoryStore(map[string]state{"A": draft})
 	var calls atomic.Int32

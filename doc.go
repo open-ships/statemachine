@@ -95,6 +95,17 @@
 // Assigning the returned state is always correct: Fire reports the state it was
 // given whenever it reports an error.
 //
+// State-owning executions are different: reading State before Fire is a second,
+// racy operation, and a queued Runtime may commit several follow-up transitions
+// before Fire returns. [NewInstanceWithObservers], queued.NewWithObservers and
+// statechart.Chart.NewWithObservers attach immutable observers at the ownership
+// seam. They emit an [Observation] for every committed node exit and entry. A
+// flat self-transition changes no position and emits nothing.
+//
+// Observations describe one execution, not a registry. Construction is
+// restoration and emits nothing, so a fleet-wide census must seed its initial
+// counts independently before folding observation deltas.
+//
 // # Working with a flat definition
 //
 // A flat table is exported data you wrote and kept, so structural operations on

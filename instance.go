@@ -32,10 +32,12 @@ var ErrInFlight = errors.New("transition already in flight")
 // The zero Instance uses the zero Machine and the zero state and is ready for
 // use. An Instance must not be copied after first use.
 type Instance[S, E comparable, T any] struct {
-	mu       sync.Mutex
-	machine  Machine[S, E, T]
-	state    S
-	inFlight bool
+	mu        sync.Mutex
+	machine   Machine[S, E, T]
+	state     S
+	inFlight  bool
+	observers []Observer[S, E, T]
+	seq       uint64
 }
 
 // NewInstance returns an Instance in initial state. It copies the immutable
@@ -46,7 +48,26 @@ type Instance[S, E comparable, T any] struct {
 // Construction is the restoration seam: no unrestricted state setter is
 // provided. Construct a new Instance with the state loaded for that aggregate.
 func NewInstance[S, E comparable, T any](machine *Machine[S, E, T], initial S) *Instance[S, E, T] {
-	i := &Instance[S, E, T]{state: initial}
+	return newInstance(machine, initial, nil)
+}
+
+// NewInstanceWithObservers is like [NewInstance] and attaches observers for
+// the lifetime of the returned Instance. Construction and restoration emit no
+// observations. Nil observers are ignored.
+func NewInstanceWithObservers[S, E comparable, T any](
+	machine *Machine[S, E, T],
+	initial S,
+	observers ...Observer[S, E, T],
+) *Instance[S, E, T] {
+	return newInstance(machine, initial, observers)
+}
+
+func newInstance[S, E comparable, T any](
+	machine *Machine[S, E, T],
+	initial S,
+	observers []Observer[S, E, T],
+) *Instance[S, E, T] {
+	i := &Instance[S, E, T]{state: initial, observers: copyObservers(observers)}
 	if machine != nil {
 		i.machine = *machine
 	}
@@ -95,12 +116,24 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error
 
 	next, err := machine.Fire(ctx, from, event, data)
 
+	var step uint64
+	var observers []Observer[S, E, T]
+
 	i.mu.Lock()
 	if err == nil {
 		i.state = next
+		if from != next && len(i.observers) != 0 {
+			step = i.seq + 1
+			i.seq += 2
+			observers = i.observers
+		}
 	}
 	committed := i.state
 	i.mu.Unlock()
+
+	if len(observers) != 0 {
+		deliverTransitionObservations(observers, ctx, step, step, from, next, event, data)
+	}
 
 	return committed, err
 }

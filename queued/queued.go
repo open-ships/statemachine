@@ -39,17 +39,40 @@ var (
 // not keep a permanent worker goroutine: the goroutine that drains roots exits
 // whenever the root queue becomes empty.
 type Runtime[S, E comparable, T any] struct {
-	mu      sync.Mutex
-	machine *statemachine.Machine[S, E, T]
-	state   S
-	roots   []*root[E, T, S]
-	running bool
+	mu        sync.Mutex
+	machine   *statemachine.Machine[S, E, T]
+	state     S
+	roots     []*root[E, T, S]
+	running   bool
+	observers []statemachine.Observer[S, E, T]
+	seq       uint64
 }
 
 // New constructs a Runtime in initial state. A nil machine means the zero
 // Machine, which refuses every event.
 func New[S, E comparable, T any](machine *statemachine.Machine[S, E, T], initial S) *Runtime[S, E, T] {
-	return &Runtime[S, E, T]{machine: machine, state: initial}
+	return newRuntime(machine, initial, nil)
+}
+
+// NewWithObservers is like [New] and attaches observers for the lifetime of
+// the Runtime. Construction and restoration emit no observations. Nil
+// observers are ignored.
+func NewWithObservers[S, E comparable, T any](
+	machine *statemachine.Machine[S, E, T],
+	initial S,
+	observers ...statemachine.Observer[S, E, T],
+) *Runtime[S, E, T] {
+	return newRuntime(machine, initial, observers)
+}
+
+func newRuntime[S, E comparable, T any](
+	machine *statemachine.Machine[S, E, T],
+	initial S,
+	observers []statemachine.Observer[S, E, T],
+) *Runtime[S, E, T] {
+	return &Runtime[S, E, T]{
+		machine: machine, state: initial, observers: copyObservers(observers),
+	}
 }
 
 // State reports the last committed state. While a Guard or Do is running it
@@ -307,6 +330,7 @@ func (r *Runtime[S, E, T]) execute(req *root[E, T, S]) outcome[S] {
 
 func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 	c := &cascade[E, T]{active: true}
+	var run uint64
 	x := &execution{active: c.isActive}
 	x.enqueue = func(ctx context.Context, event, data any) error {
 		typedEvent, ok := assign[E](event)
@@ -360,9 +384,26 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 			break
 		}
 
+		var step uint64
+		var observers []statemachine.Observer[S, E, T]
 		r.mu.Lock()
 		r.state = to
+		if from != to && len(r.observers) != 0 {
+			step = r.seq + 1
+			r.seq += 2
+			if run == 0 {
+				run = step
+			}
+			observers = r.observers
+		}
 		r.mu.Unlock()
+
+		if len(observers) != 0 {
+			observerCtx := observationContext(current.ctx, c.isActive)
+			deliverTransitionObservations(
+				observers, observerCtx, step, run, from, to, current.event, current.data,
+			)
+		}
 
 		var ok bool
 		current, ok = c.next()

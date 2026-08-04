@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/open-ships/statemachine"
 	"github.com/open-ships/statemachine/statechart"
 )
 
@@ -132,6 +133,120 @@ func TestCompositeWithoutInitialMayRemainActive(t *testing.T) {
 	}
 	if got := instance.State(); got != a {
 		t.Fatalf("State = %v, want active composite %v", got, a)
+	}
+}
+
+func TestPositionProjectsTheCompiledHierarchy(t *testing.T) {
+	chart := statechart.MustCompile(definition{
+		States:    baseStates(),
+		Substates: hierarchy(),
+		Initials: []statechart.Initial[testState]{
+			{Parent: root, Child: a},
+			{Parent: a, Child: a1},
+			{Parent: b, Child: b1},
+		},
+	})
+
+	states := slices.Collect(chart.States())
+	wantStates := []testState{root, a, a1, a2, b, b1, other}
+	if !slices.Equal(states, wantStates) {
+		t.Fatalf("States = %v, want %v", states, wantStates)
+	}
+	var nilChart *statechart.Chart[testState, testEvent, *testData]
+	if nilStates := slices.Collect(nilChart.States()); nilStates != nil {
+		t.Fatalf("nil Chart States = %v, want nil", nilStates)
+	}
+
+	position, ok := chart.Position(a1)
+	if !ok {
+		t.Fatal("Position rejected a declared active state")
+	}
+	if active, valid := position.Active(); !valid || active != a1 {
+		t.Fatalf("Active = (%v, %v), want (%v, true)", active, valid, a1)
+	}
+	if path := slices.Collect(position.Path()); !slices.Equal(path, []testState{a1, a, root}) {
+		t.Fatalf("Path = %v", path)
+	}
+	for state, want := range map[testState]statechart.Status{
+		a1:    statechart.StatusActive,
+		a:     statechart.StatusEnclosing,
+		root:  statechart.StatusEnclosing,
+		a2:    statechart.StatusInactive,
+		b:     statechart.StatusInactive,
+		other: statechart.StatusInactive,
+	} {
+		if got, known := position.Status(state); !known || got != want {
+			t.Errorf("Status(%v) = (%v, %v), want (%v, true)", state, got, known, want)
+		}
+	}
+	if _, known := position.Status(testState("missing")); known {
+		t.Fatal("Status accepted an undeclared state")
+	}
+	if _, ok := chart.Position(testState("missing")); ok {
+		t.Fatal("Position accepted an undeclared active state")
+	}
+	if destination, ok := chart.Destination(root); !ok || destination != a1 {
+		t.Fatalf("Destination(root) = (%v, %v), want (%v, true)", destination, ok, a1)
+	}
+	if destination, ok := chart.Destination(other); !ok || destination != other {
+		t.Fatalf("Destination(other) = (%v, %v), want (%v, true)", destination, ok, other)
+	}
+	if _, ok := chart.Destination(testState("missing")); ok {
+		t.Fatal("Destination accepted an undeclared state")
+	}
+
+	var zero statechart.Position[testState]
+	if _, ok := zero.Active(); ok || slices.Collect(zero.Path()) != nil {
+		t.Fatalf("zero Position is valid")
+	}
+	if _, known := zero.Status(root); known {
+		t.Fatal("zero Position knows a state")
+	}
+}
+
+func TestArrowsExposeGuardFreeInheritedCandidates(t *testing.T) {
+	guardCalls := 0
+	guard := func(context.Context, statechart.Info[testState, testEvent], *testData) error {
+		guardCalls++
+		return errors.New("not evaluated")
+	}
+	chart := statechart.MustCompile(definition{
+		States:    baseStates(),
+		Substates: hierarchy(),
+		Initials: []statechart.Initial[testState]{
+			{Parent: a, Child: a1},
+			{Parent: b, Child: b1},
+		},
+		Transitions: []transition{
+			{From: a1, Event: goB, To: b, Guard: guard},
+			{From: a1, Event: goB, To: other, Guard: guard},
+			{From: a, Event: goB, To: b},
+			{From: root, Event: goB, To: other},
+			{From: a, Event: touch, To: a, Kind: statechart.Internal},
+			{From: a, Event: reset, To: a, Kind: statechart.Reentry},
+		},
+	})
+
+	got := slices.Collect(chart.Arrows(a1))
+	want := []statechart.Arrow[testState, testEvent]{
+		{Source: a1, Handler: a1, Target: b, Destination: b1, Event: goB, Kind: statechart.External, Guarded: true},
+		{Source: a1, Handler: a1, Target: other, Destination: other, Event: goB, Kind: statechart.External, Guarded: true},
+		{Source: a1, Handler: a, Target: b, Destination: b1, Event: goB, Kind: statechart.External},
+		{Source: a1, Handler: a, Target: a, Destination: a1, Event: touch, Kind: statechart.Internal},
+		{Source: a1, Handler: a, Target: a, Destination: a1, Event: reset, Kind: statechart.Reentry},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Arrows = %+v, want %+v", got, want)
+	}
+	if guardCalls != 0 {
+		t.Fatalf("Arrows called Guards %d times", guardCalls)
+	}
+	if unknown := slices.Collect(chart.Arrows(testState("missing"))); unknown != nil {
+		t.Fatalf("unknown Arrows = %+v, want nil", unknown)
+	}
+	var nilChart *statechart.Chart[testState, testEvent, *testData]
+	if nilArrows := slices.Collect(nilChart.Arrows(a1)); nilArrows != nil {
+		t.Fatalf("nil Chart Arrows = %+v, want nil", nilArrows)
 	}
 }
 
@@ -385,6 +500,7 @@ func TestInternalTransitionRunsOnlyEffectAndKeepsLeaf(t *testing.T) {
 }
 
 func TestReentryExitsThroughHandlerAndEntersItsInitialChain(t *testing.T) {
+	var observations []statechart.Observation[testState, testEvent]
 	chart := statechart.MustCompile(definition{
 		States: []state{
 			{Name: a, Entry: []action{record("enter a")}, Exit: []action{record("exit a")}},
@@ -395,7 +511,11 @@ func TestReentryExitsThroughHandlerAndEntersItsInitialChain(t *testing.T) {
 		Initials:    []statechart.Initial[testState]{{Parent: a, Child: a2}},
 		Transitions: []transition{{From: a, Event: reset, To: a, Kind: statechart.Reentry, Do: record("effect")}},
 	})
-	instance, _ := chart.New(a1)
+	instance, _ := chart.NewWithObservers(a1, func(
+		_ context.Context, observation statechart.Observation[testState, testEvent], _ *testData,
+	) {
+		observations = append(observations, observation)
+	})
 	data := &testData{}
 	if err := instance.Fire(context.Background(), reset, data); err != nil {
 		t.Fatal(err)
@@ -403,6 +523,227 @@ func TestReentryExitsThroughHandlerAndEntersItsInitialChain(t *testing.T) {
 	want := []string{"exit a1", "exit a", "effect", "enter a", "enter a2"}
 	if instance.State() != a2 || !slices.Equal(data.trace, want) {
 		t.Fatalf("State/trace = %v/%v, want %v/%v", instance.State(), data.trace, a2, want)
+	}
+	wantMoves := []struct {
+		move  statemachine.Move
+		state testState
+	}{
+		{statemachine.Exited, a1},
+		{statemachine.Exited, a},
+		{statemachine.Entered, a},
+		{statemachine.Entered, a2},
+	}
+	if len(observations) != len(wantMoves) {
+		t.Fatalf("observations = %+v", observations)
+	}
+	for index, want := range wantMoves {
+		got := observations[index]
+		if got.Move != want.move || got.State != want.state || got.Remaining != uint64(len(wantMoves)-index-1) {
+			t.Errorf("observation[%d] = %+v, want %v %v", index, got, want.move, want.state)
+		}
+	}
+}
+
+func TestStatechartObservesEveryCommittedNodeAfterEntryProcessing(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "request")
+	data := &testData{}
+	var instance *statechart.Instance[testState, testEvent, *testData]
+	var observations []statechart.Observation[testState, testEvent]
+	var traces [][]string
+	var activeStates []testState
+	var nestedErrors []error
+	var contexts []any
+	var observedData []*testData
+
+	observer := func(
+		observerCtx context.Context,
+		observation statechart.Observation[testState, testEvent],
+		observed *testData,
+	) {
+		observations = append(observations, observation)
+		traces = append(traces, slices.Clone(observed.trace))
+		position, ok := instance.Position()
+		contexts = append(contexts, observerCtx.Value(contextKey{}))
+		observedData = append(observedData, observed)
+		if !ok {
+			return
+		}
+		active, _ := position.Active()
+		activeStates = append(activeStates, active)
+		nestedErrors = append(nestedErrors, instance.Fire(observerCtx, goB, observed))
+	}
+
+	chart := statechart.MustCompile(definition{
+		States: []state{
+			{Name: root},
+			{Name: a, Exit: []action{record("exit a")}},
+			{Name: a1, Exit: []action{record("exit a1")}},
+			{Name: b, Entry: []action{record("enter b")}},
+			{Name: b1, Entry: []action{record("enter b1")}},
+		},
+		Substates: []statechart.Substate[testState]{
+			{Child: a, Parent: root}, {Child: a1, Parent: a},
+			{Child: b, Parent: root}, {Child: b1, Parent: b},
+		},
+		Initials:    []statechart.Initial[testState]{{Parent: b, Child: b1}},
+		Transitions: []transition{{From: a, Event: goB, To: b, Do: record("effect")}},
+	})
+	var err error
+	instance, err = chart.NewWithObservers(a1, nil, observer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observations) != 0 {
+		t.Fatal("restoration emitted observations")
+	}
+	if err := instance.Fire(ctx, goB, data); err != nil {
+		t.Fatal(err)
+	}
+
+	info := statechart.Info[testState, testEvent]{
+		Source: a1, Handler: a, Target: b, Destination: b1, Event: goB, Kind: statechart.External,
+	}
+	want := []statechart.Observation[testState, testEvent]{
+		{Observation: statemachine.Observation[testState, testEvent]{Seq: 1, Step: 1, Run: 1, Remaining: 3, Move: statemachine.Exited, State: a1, Event: goB}, Info: info},
+		{Observation: statemachine.Observation[testState, testEvent]{Seq: 2, Step: 1, Run: 1, Remaining: 2, Move: statemachine.Exited, State: a, Event: goB}, Info: info},
+		{Observation: statemachine.Observation[testState, testEvent]{Seq: 3, Step: 1, Run: 1, Remaining: 1, Move: statemachine.Entered, State: b, Event: goB}, Info: info},
+		{Observation: statemachine.Observation[testState, testEvent]{Seq: 4, Step: 1, Run: 1, Move: statemachine.Entered, State: b1, Event: goB}, Info: info},
+	}
+	if !slices.Equal(observations, want) {
+		t.Fatalf("observations = %+v, want %+v", observations, want)
+	}
+	wantTrace := []string{"exit a1", "exit a", "effect", "enter b", "enter b1"}
+	for index := range observations {
+		if !slices.Equal(traces[index], wantTrace) || activeStates[index] != b1 || nestedErrors[index] != statechart.ErrInFlight ||
+			contexts[index] != "request" || observedData[index] != data {
+			t.Errorf("callback[%d] trace/state/nested/context/data = %v/%v/%v/%v/%p", index, traces[index], activeStates[index], nestedErrors[index], contexts[index], observedData[index])
+		}
+	}
+}
+
+func TestStatechartCommittedEntryFailuresStillObserve(t *testing.T) {
+	sentinel := errors.New("entry failed")
+	for _, test := range []struct {
+		name  string
+		entry action
+	}{
+		{"error", func(context.Context, statechart.Info[testState, testEvent], *testData) error { return sentinel }},
+		{"panic", func(context.Context, statechart.Info[testState, testEvent], *testData) error { panic(sentinel) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var observations []statechart.Observation[testState, testEvent]
+			chart := statechart.MustCompile(definition{
+				States:      []state{{Name: a}, {Name: b, Entry: []action{test.entry}}},
+				Transitions: []transition{{From: a, Event: goB, To: b}},
+			})
+			instance, _ := chart.NewWithObservers(a, func(
+				_ context.Context, observation statechart.Observation[testState, testEvent], _ *testData,
+			) {
+				observations = append(observations, observation)
+			})
+
+			var err error
+			var recovered any
+			func() {
+				defer func() { recovered = recover() }()
+				err = instance.Fire(context.Background(), goB, &testData{})
+			}()
+			if test.name == "error" {
+				var actionErr *statechart.ActionError
+				if !errors.As(err, &actionErr) || !actionErr.Committed || !errors.Is(err, sentinel) {
+					t.Fatalf("entry error = %#v", err)
+				}
+			} else if recovered != sentinel {
+				t.Fatalf("recovered = %#v, want sentinel", recovered)
+			}
+			if instance.State() != b || len(observations) != 2 || observations[1].Remaining != 0 {
+				t.Fatalf("state/observations = %v/%+v", instance.State(), observations)
+			}
+		})
+	}
+}
+
+func TestStatechartCommittedEntryGoexitStillObservesAndObserverFailuresAreIsolated(t *testing.T) {
+	var delivered []statechart.Observation[testState, testEvent]
+	panicCalls := 0
+	goexitCalls := 0
+	chart := statechart.MustCompile(definition{
+		States: []state{{Name: a}, {Name: b, Entry: []action{func(context.Context, statechart.Info[testState, testEvent], *testData) error {
+			runtime.Goexit()
+			return nil
+		}}}},
+		Transitions: []transition{{From: a, Event: goB, To: b}},
+	})
+	instance, _ := chart.NewWithObservers(
+		a,
+		func(context.Context, statechart.Observation[testState, testEvent], *testData) {
+			panicCalls++
+			panic("observer")
+		},
+		func(context.Context, statechart.Observation[testState, testEvent], *testData) {
+			goexitCalls++
+			runtime.Goexit()
+		},
+		func(_ context.Context, observation statechart.Observation[testState, testEvent], _ *testData) {
+			delivered = append(delivered, observation)
+		},
+	)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = instance.Fire(context.Background(), goB, &testData{})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("entry Goexit stranded Fire")
+	}
+	if instance.State() != b || len(delivered) != 2 || delivered[1].Remaining != 0 {
+		t.Fatalf("state/delivered = %v/%+v", instance.State(), delivered)
+	}
+	if panicCalls != 2 || goexitCalls != 2 {
+		t.Fatalf("failed observer calls = panic %d, Goexit %d; want 2 each", panicCalls, goexitCalls)
+	}
+	if err := instance.Fire(context.Background(), unknownEvent, &testData{}); errors.Is(err, statechart.ErrInFlight) {
+		t.Fatalf("in-flight survived Goexit: %v", err)
+	}
+}
+
+func TestStatechartPrecommitFailuresAndInternalTransitionsAreObservationSilent(t *testing.T) {
+	sentinel := errors.New("failed")
+	for _, test := range []struct {
+		name   string
+		exit   action
+		effect action
+	}{
+		{"exit", func(context.Context, statechart.Info[testState, testEvent], *testData) error { return sentinel }, nil},
+		{"effect", nil, func(context.Context, statechart.Info[testState, testEvent], *testData) error { return sentinel }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			chart := statechart.MustCompile(definition{
+				States:      []state{{Name: a, Exit: []action{test.exit}}, {Name: b}},
+				Transitions: []transition{{From: a, Event: goB, To: b, Do: test.effect}},
+			})
+			instance, _ := chart.NewWithObservers(a, func(context.Context, statechart.Observation[testState, testEvent], *testData) { calls++ })
+			if err := instance.Fire(context.Background(), goB, &testData{}); !errors.Is(err, sentinel) {
+				t.Fatalf("Fire = %v", err)
+			}
+			if calls != 0 || instance.State() != a {
+				t.Fatalf("calls/state = %d/%v", calls, instance.State())
+			}
+		})
+	}
+
+	calls := 0
+	chart := statechart.MustCompile(definition{
+		States:      []state{{Name: a}},
+		Transitions: []transition{{From: a, Event: touch, To: a, Kind: statechart.Internal}},
+	})
+	instance, _ := chart.NewWithObservers(a, func(context.Context, statechart.Observation[testState, testEvent], *testData) { calls++ })
+	if err := instance.Fire(context.Background(), touch, &testData{}); err != nil || calls != 0 {
+		t.Fatalf("internal Fire/calls = %v/%d", err, calls)
 	}
 }
 
@@ -652,5 +993,85 @@ func TestInstanceIsRaceSafeForStateAndRefusesUnknownEvent(t *testing.T) {
 	err := instance.Fire(context.Background(), unknownEvent, &testData{})
 	if !errors.Is(err, statechart.ErrNotPermitted) || instance.State() != a {
 		t.Fatalf("Fire = %v, state = %v", err, instance.State())
+	}
+}
+
+func benchmarkChart() *statechart.Chart[testState, testEvent, *testData] {
+	return statechart.MustCompile(definition{
+		States:    baseStates(),
+		Substates: hierarchy(),
+		Initials: []statechart.Initial[testState]{
+			{Parent: a, Child: a1},
+			{Parent: b, Child: b1},
+		},
+		Transitions: []transition{
+			{From: a, Event: goB, To: b},
+			{From: b, Event: reset, To: a},
+		},
+	})
+}
+
+func BenchmarkPositionPath(b *testing.B) {
+	chart := benchmarkChart()
+	position, _ := chart.Position(a1)
+	b.ReportAllocs()
+	for b.Loop() {
+		for range position.Path() {
+		}
+	}
+}
+
+func BenchmarkInstancePositionPath(b *testing.B) {
+	chart := benchmarkChart()
+	instance, _ := chart.New(a1)
+	b.ReportAllocs()
+	for b.Loop() {
+		position, _ := instance.Position()
+		for range position.Path() {
+		}
+	}
+}
+
+func BenchmarkPositionStatus(b *testing.B) {
+	chart := benchmarkChart()
+	position, _ := chart.Position(a1)
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = position.Status(root)
+		_, _ = position.Status(other)
+	}
+}
+
+func BenchmarkArrows(b *testing.B) {
+	chart := benchmarkChart()
+	b.ReportAllocs()
+	for b.Loop() {
+		for range chart.Arrows(a1) {
+		}
+	}
+}
+
+func BenchmarkStatechartFire(b *testing.B) {
+	chart := benchmarkChart()
+	instance, _ := chart.New(a1)
+	data := &testData{}
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = instance.Fire(context.Background(), goB, data)
+		_ = instance.Fire(context.Background(), reset, data)
+	}
+}
+
+func BenchmarkStatechartFireObserved(b *testing.B) {
+	chart := benchmarkChart()
+	instance, _ := chart.NewWithObservers(
+		a1,
+		func(context.Context, statechart.Observation[testState, testEvent], *testData) {},
+	)
+	data := &testData{}
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = instance.Fire(context.Background(), goB, data)
+		_ = instance.Fire(context.Background(), reset, data)
 	}
 }
