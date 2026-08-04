@@ -216,6 +216,112 @@ func TestRootCascadesAndExternalRootsRunFIFO(t *testing.T) {
 	}
 }
 
+func TestRuntimeObservesEveryCommittedStepInOneRun(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "request")
+	rootData := &command{value: "root"}
+	followData := &command{value: "follow"}
+	var r *queued.Runtime[state, event, *command]
+	var observations []statemachine.Observation[state, event]
+	var values []string
+	var observedStates []state
+	var enqueueErrors []error
+	var fireErrors []error
+	var contexts []any
+	panicCalls := 0
+	goexitCalls := 0
+
+	m := statemachine.MustCompile([]row{
+		{From: 0, Event: start, To: 1, Do: func(ctx context.Context, _ *command) error {
+			return queued.Enqueue(ctx, first, followData)
+		}},
+		{From: 1, Event: first, To: 2},
+		{From: 2, Event: after, To: 3},
+	})
+	observer := func(observerCtx context.Context, observation statemachine.Observation[state, event], data *command) {
+		observations = append(observations, observation)
+		values = append(values, data.value)
+		observedStates = append(observedStates, r.State())
+		enqueueErrors = append(enqueueErrors, queued.Enqueue(observerCtx, never, data))
+		_, err := r.Fire(observerCtx, after, data)
+		fireErrors = append(fireErrors, err)
+		contexts = append(contexts, observerCtx.Value(contextKey{}))
+	}
+	r = queued.NewWithObservers(
+		m,
+		state(0),
+		func(context.Context, statemachine.Observation[state, event], *command) {
+			panicCalls++
+			panic("observer panic")
+		},
+		func(context.Context, statemachine.Observation[state, event], *command) {
+			goexitCalls++
+			runtime.Goexit()
+		},
+		observer,
+	)
+
+	if got, err := r.Fire(ctx, start, rootData); err != nil || got != 2 {
+		t.Fatalf("root Fire = (%v, %v), want (2, nil)", got, err)
+	}
+	if got, err := r.Fire(ctx, after, rootData); err != nil || got != 3 {
+		t.Fatalf("later Fire = (%v, %v), want (3, nil)", got, err)
+	}
+	want := []statemachine.Observation[state, event]{
+		{Seq: 1, Step: 1, Run: 1, Remaining: 1, Move: statemachine.Exited, State: 0, Event: start},
+		{Seq: 2, Step: 1, Run: 1, Move: statemachine.Entered, State: 1, Event: start},
+		{Seq: 3, Step: 3, Run: 1, Remaining: 1, Move: statemachine.Exited, State: 1, Event: first},
+		{Seq: 4, Step: 3, Run: 1, Move: statemachine.Entered, State: 2, Event: first},
+		{Seq: 5, Step: 5, Run: 5, Remaining: 1, Move: statemachine.Exited, State: 2, Event: after},
+		{Seq: 6, Step: 5, Run: 5, Move: statemachine.Entered, State: 3, Event: after},
+	}
+	if !slices.Equal(observations, want) {
+		t.Fatalf("observations = %+v, want %+v", observations, want)
+	}
+	if !slices.Equal(values, []string{"root", "root", "follow", "follow", "root", "root"}) {
+		t.Fatalf("observer data = %v", values)
+	}
+	if !slices.Equal(observedStates, []state{1, 1, 2, 2, 3, 3}) {
+		t.Fatalf("observer states = %v", observedStates)
+	}
+	if panicCalls != len(want) || goexitCalls != len(want) {
+		t.Fatalf("failed observer calls = panic %d, Goexit %d; want %d each", panicCalls, goexitCalls, len(want))
+	}
+	for index := range observations {
+		if enqueueErrors[index] != queued.ErrNotRunning || fireErrors[index] != queued.ErrReentrant || contexts[index] != "request" {
+			t.Errorf("observer[%d] enqueue/fire/context = %v/%v/%v", index, enqueueErrors[index], fireErrors[index], contexts[index])
+		}
+	}
+}
+
+func TestRuntimeSilentSelfRootAnchorsRunAtFirstChangingFollowup(t *testing.T) {
+	selfCalls := 0
+	var observations []statemachine.Observation[state, event]
+	m := statemachine.MustCompile([]row{
+		{From: 0, Event: start, To: 0, Do: func(ctx context.Context, data *command) error {
+			selfCalls++
+			return queued.Enqueue(ctx, first, data)
+		}},
+		{From: 0, Event: first, To: 1},
+	})
+	r := queued.NewWithObservers(m, state(0), func(
+		_ context.Context, observation statemachine.Observation[state, event], _ *command,
+	) {
+		observations = append(observations, observation)
+	})
+
+	if got, err := r.Fire(context.Background(), start, &command{}); err != nil || got != 1 {
+		t.Fatalf("Fire = (%v, %v), want (1, nil)", got, err)
+	}
+	want := []statemachine.Observation[state, event]{
+		{Seq: 1, Step: 1, Run: 1, Remaining: 1, Move: statemachine.Exited, State: 0, Event: first},
+		{Seq: 2, Step: 1, Run: 1, Move: statemachine.Entered, State: 1, Event: first},
+	}
+	if selfCalls != 1 || !slices.Equal(observations, want) {
+		t.Fatalf("self calls/observations = %d/%+v", selfCalls, observations)
+	}
+}
+
 func TestReentrantFireIsRejectedAndEnqueueContextExpires(t *testing.T) {
 	var r *queued.Runtime[state, event, *command]
 	var nestedState state
@@ -650,5 +756,34 @@ func assertBlocked[T any](t *testing.T, ch <-chan T) {
 	case value := <-ch:
 		t.Fatalf("completed early with %v", value)
 	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+var benchmarkRuntimeMachine = statemachine.MustCompile([]row{
+	{From: 0, Event: start, To: 1},
+	{From: 1, Event: after, To: 0},
+})
+
+func BenchmarkRuntimeFire(b *testing.B) {
+	r := queued.New(benchmarkRuntimeMachine, state(0))
+	data := &command{}
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = r.Fire(context.Background(), start, data)
+		_, _ = r.Fire(context.Background(), after, data)
+	}
+}
+
+func BenchmarkRuntimeFireObserved(b *testing.B) {
+	r := queued.NewWithObservers(
+		benchmarkRuntimeMachine,
+		state(0),
+		func(context.Context, statemachine.Observation[state, event], *command) {},
+	)
+	data := &command{}
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = r.Fire(context.Background(), start, data)
+		_, _ = r.Fire(context.Background(), after, data)
 	}
 }

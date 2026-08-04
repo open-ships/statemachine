@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/open-ships/statemachine"
 	"github.com/open-ships/statemachine/statechart"
 )
 
@@ -72,4 +73,85 @@ func Example() {
 	// answer: active [exit ringing answer enter active]
 	// restart: ringing [exit active exit call restart enter call enter ringing]
 	// hangup: idle [exit ringing exit call hangup enter idle]
+}
+
+func ExamplePosition() {
+	type State string
+	type Event string
+
+	const (
+		Call    State = "call"
+		Ringing State = "ringing"
+		Active  State = "active"
+		Idle    State = "idle"
+	)
+
+	chart := statechart.MustCompile(statechart.Definition[State, Event, struct{}]{
+		States: []statechart.State[State, Event, struct{}]{
+			{Name: Call}, {Name: Ringing}, {Name: Active}, {Name: Idle},
+		},
+		Substates: []statechart.Substate[State]{
+			{Child: Ringing, Parent: Call},
+			{Child: Active, Parent: Call},
+		},
+	})
+	position, _ := chart.Position(Ringing)
+	for state := range chart.States() {
+		status, _ := position.Status(state)
+		fmt.Println(state, status)
+	}
+
+	// Output:
+	// call enclosing
+	// ringing active
+	// active inactive
+	// idle inactive
+}
+
+func ExampleObserver_census() {
+	type State string
+	type Event string
+	type Command struct{ ID string }
+
+	const (
+		Call    State = "call"
+		Ringing State = "ringing"
+		Idle    State = "idle"
+		Hangup  Event = "hangup"
+	)
+
+	chart := statechart.MustCompile(statechart.Definition[State, Event, *Command]{
+		States: []statechart.State[State, Event, *Command]{
+			{Name: Call}, {Name: Ringing}, {Name: Idle},
+		},
+		Substates:   []statechart.Substate[State]{{Child: Ringing, Parent: Call}},
+		Transitions: []statechart.Transition[State, Event, *Command]{{From: Call, Event: Hangup, To: Idle}},
+	})
+
+	// A delta stream cannot reconstruct aggregates that existed before the
+	// observer. Seed their loaded positions first.
+	counts := map[State]int{}
+	loaded, _ := chart.Position(Ringing)
+	for state := range loaded.Path() {
+		counts[state]++
+	}
+
+	observer := func(_ context.Context, observation statechart.Observation[State, Event], command *Command) {
+		delta := -1
+		if observation.Move == statemachine.Entered {
+			delta = 1
+		}
+		counts[observation.State] += delta
+		fmt.Println(command.ID, observation.Seq, observation.Move, observation.State)
+	}
+
+	run, _ := chart.NewWithObservers(Ringing, observer)
+	_ = run.Fire(context.Background(), Hangup, &Command{ID: "A1"})
+	fmt.Println("census:", counts[Call], counts[Ringing], counts[Idle])
+
+	// Output:
+	// A1 1 exited ringing
+	// A1 2 exited call
+	// A1 3 entered idle
+	// census: 0 0 1
 }

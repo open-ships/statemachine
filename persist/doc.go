@@ -23,5 +23,8 @@
 //
 // The package supplies two adapters: [MemoryStore] for local execution and
 // tests, and [FuncStore] for binding an application transaction implementation.
-// [Fire] is the only orchestration function.
+// [Fire] reports the Store's state result. [Step] additionally exposes whether
+// the transition callback ran, its From and attempted To, and whether the Store
+// confirmed success. A failed Store result is never treated as proof that an
+// external commit did not occur.
 package persist

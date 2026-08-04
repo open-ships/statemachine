@@ -55,6 +55,20 @@ type FuncStore[K, S comparable, X any] struct {
 	UpdateFunc func(context.Context, K, func(context.Context, S, X) (S, error)) (S, error)
 }
 
+// StepResult describes the transition attempt made inside a Store update.
+// From and To are meaningful only when Attempted is true. TransitionError is
+// the exact error returned by Machine.Fire, before any later Store error.
+// Confirmed is true only when Store.Update returned success; false does not
+// prove that an external commit did not happen.
+type StepResult[S, E comparable] struct {
+	From            S
+	To              S
+	Event           E
+	Attempted       bool
+	Confirmed       bool
+	TransitionError error
+}
+
 // Update delegates to UpdateFunc.
 func (s FuncStore[K, S, X]) Update(
 	ctx context.Context,
@@ -82,18 +96,57 @@ func Fire[K, S, E comparable, T, X any](
 	event E,
 	data func(X) T,
 ) (S, error) {
+	state, _, err := apply(ctx, store, key, machine, event, data)
+	return state, err
+}
+
+// Step is like [Fire] but also reports the transition attempt performed inside
+// the Store. It is useful for diagnostics and for adapters that need From, which
+// is loaded inside Store.Update. StepResult is not a durable observation: write
+// durable events through the Store's transactional unit of work instead.
+func Step[K, S, E comparable, T, X any](
+	ctx context.Context,
+	store Store[K, S, X],
+	key K,
+	machine *statemachine.Machine[S, E, T],
+	event E,
+	data func(X) T,
+) (StepResult[S, E], error) {
+	_, result, err := apply(ctx, store, key, machine, event, data)
+	return result, err
+}
+
+func apply[K, S, E comparable, T, X any](
+	ctx context.Context,
+	store Store[K, S, X],
+	key K,
+	machine *statemachine.Machine[S, E, T],
+	event E,
+	data func(X) T,
+) (S, StepResult[S, E], error) {
+	result := StepResult[S, E]{Event: event}
 	if isNilStore(store) {
 		var zero S
-		return zero, ErrNoStore
+		return zero, result, ErrNoStore
 	}
 	if machine == nil {
 		machine = new(statemachine.Machine[S, E, T])
 	}
-	return store.Update(ctx, key, func(ctx context.Context, from S, unit X) (S, error) {
+	state, err := store.Update(ctx, key, func(ctx context.Context, from S, unit X) (S, error) {
 		var value T
 		if data != nil {
 			value = data(unit)
 		}
-		return machine.Fire(ctx, from, event, value)
+		result.From = from
+		result.To = from
+		result.Attempted = true
+		to, transitionErr := machine.Fire(ctx, from, event, value)
+		result.To = to
+		result.TransitionError = transitionErr
+		return to, transitionErr
 	})
+	if err == nil {
+		result.Confirmed = true
+	}
+	return state, result, err
 }

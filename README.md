@@ -125,10 +125,20 @@ The optional state-owning interface adds:
 | | |
 |---|---|
 | `NewInstance(machine, initial)` | create one fail-fast, in-memory execution |
+| `NewInstanceWithObservers(machine, initial, observers...)` | create an execution that reports committed node exits and entries |
 | `Instance.State()` | read its last committed state |
 | `Instance.Fire(ctx, event, data)` | apply one event without passing the state |
 | `Instance.Permitted(ctx, data)` | eagerly snapshot its current affordances |
 | `ErrInFlight` | another fire is already executing on that instance |
+
+An `Observation` names one exited or entered state. Its `Seq` is consecutive
+within one observed execution, `Step` groups the non-empty position change made
+by one event, and `Remaining == 0` closes that Step. Context and `T` are passed
+to the typed `Observer` separately. Observers run synchronously without an
+execution lock, but in isolation: an observer panic or `runtime.Goexit` cannot
+change the transition outcome. Flat self-transitions change no position and are
+observation-silent. A shared observer can be called concurrently by different
+executions and must synchronize its own census or sink.
 
 `T` is the value handed to every `Guard` and `Do` — your aggregate, plus whatever this command needs.
 It is passed to `Fire` rather than stored, so one immutable `Machine` serves every request while
@@ -152,6 +162,16 @@ A queued callback schedules same-runtime follow-ups with `queued.Enqueue` and th
 given. It must never synchronously call `Runtime.Fire`; replacing that context defeats deadlock
 detection.
 
+Statechart inspection is split between immutable definition facts and one
+execution's current position. `Chart.States` enumerates compiled states,
+`Chart.Arrows(source)` exposes every statically possible inherited transition
+without running Guards, and `Chart.Position(active)` projects an exact loaded
+state. `Instance.Position` takes the same atomic committed-state snapshot as
+`State`. A Position classifies every declared state as inactive, enclosing, or
+the exact active state. The original `Definition` remains the source for
+declared parent and initial edges; the Chart API does not duplicate those
+relationships.
+
 ## Hazards
 
 **Discarding `Machine.Fire`'s returned state is never correct.** The effect has already run, and
@@ -168,6 +188,9 @@ write and must invoke the transition callback exactly once after a successful lo
 database Store should put aggregate changes and an outbox record in the same unit of work. Only work
 performed through that transaction is atomic. A conflict discovered after an effect is not retried;
 an application retry must reload and use a stable idempotency key.
+`persist.Step` additionally reports the loaded From and attempted To, but only
+`StepResult.Confirmed` says the Store returned success; false is not proof that
+an external commit did not happen.
 
 The rest — guard purity, how `ErrNotPermitted` propagates through nested machines, why `S` and `E`
 must be strictly comparable, and why generated tables want `Compile` rather than `MustCompile` — are

@@ -21,6 +21,13 @@
 // commit status. Actions completed before an error or panic are not rolled
 // back. An Instance rejects overlapping and same-instance recursive Fire calls
 // with [ErrInFlight].
+//
+// [Chart.States], [Chart.Arrows] and [Chart.Position] expose the compiled
+// hierarchy, statically possible inherited transitions, and a pure projection
+// of one active state. [Instance.Position] snapshots the owned state. An
+// Instance created by [Chart.NewWithObservers] emits committed exits and entries
+// after entry processing terminates, including when an entry error, panic, or
+// runtime.Goexit occurs after commit.
 package statechart
 
 import (
@@ -159,6 +166,7 @@ type Chart[S, E comparable, T any] struct {
 	initial map[S]S
 	rows    map[transitionKey[S, E]][]Transition[S, E, T]
 	events  map[S][]E
+	shape   *shape[S]
 }
 
 // Compile validates and copies definition. It rejects duplicate or undeclared
@@ -280,6 +288,7 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Chart[S, 
 	if len(problems) != 0 {
 		return nil, errors.Join(problems...)
 	}
+	c.shape = compileShape(c.order, c.parent)
 	return c, nil
 }
 
@@ -350,13 +359,32 @@ func MustCompile[S, E comparable, T any](definition Definition[S, E, T]) *Chart[
 // chain, New resolves it without running entry actions. A composite state with
 // no Initial remains active itself.
 func (c *Chart[S, E, T]) New(initial S) (*Instance[S, E, T], error) {
+	return c.newInstance(initial, nil)
+}
+
+// NewWithObservers is like [Chart.New] and attaches observers for the lifetime
+// of the returned Instance. Restoration emits no observations. Nil observers
+// are ignored.
+func (c *Chart[S, E, T]) NewWithObservers(
+	initial S,
+	observers ...Observer[S, E, T],
+) (*Instance[S, E, T], error) {
+	return c.newInstance(initial, observers)
+}
+
+func (c *Chart[S, E, T]) newInstance(
+	initial S,
+	observers []Observer[S, E, T],
+) (*Instance[S, E, T], error) {
 	if c == nil {
 		return nil, errors.New("statechart: cannot create an instance from a nil chart")
 	}
 	if _, known := c.states[initial]; !known {
 		return nil, fmt.Errorf("statechart: initial state %v is undeclared", initial)
 	}
-	return &Instance[S, E, T]{chart: c, state: c.destination(initial)}, nil
+	return &Instance[S, E, T]{
+		chart: c, state: c.destination(initial), observers: copyObservers(observers),
+	}, nil
 }
 
 func (c *Chart[S, E, T]) destination(state S) S {
@@ -538,10 +566,12 @@ func (e *ActionError) Unwrap() error {
 // it starts in the zero state with an empty Chart and refuses every event. An
 // Instance must not be copied after first use.
 type Instance[S, E comparable, T any] struct {
-	chart    *Chart[S, E, T]
-	mu       sync.RWMutex
-	state    S
-	inFlight bool
+	chart     *Chart[S, E, T]
+	mu        sync.RWMutex
+	state     S
+	inFlight  bool
+	observers []Observer[S, E, T]
+	seq       uint64
 }
 
 // State returns the committed active state. During exits and the transition
@@ -573,6 +603,9 @@ func (i *Instance[S, E, T]) State() S {
 //
 // Fire does not interpret ctx cancellation itself; it passes ctx to Guards and
 // Actions, which decide whether cancellation should decline or fail the event.
+// Attached observers receive a committed exit/entry batch after entry actions
+// terminate. Observer failures are isolated and cannot replace this method's
+// error or panic.
 func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
 	i.mu.Lock()
 	if i.inFlight {
@@ -621,9 +654,20 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
 		return &ActionError{Phase: PhaseEffect, Err: err}
 	}
 
+	var step uint64
+	var observers []Observer[S, E, T]
 	i.mu.Lock()
 	i.state = destination
+	total := len(exits) + len(entries)
+	if total != 0 && len(i.observers) != 0 {
+		step = i.seq + 1
+		i.seq += uint64(total)
+		observers = i.observers
+	}
 	i.mu.Unlock()
+	if len(observers) != 0 {
+		defer deliverTransitionObservations(observers, ctx, step, exits, entries, event, info, data)
+	}
 	for _, state := range entries {
 		for _, action := range i.chart.states[state].entry {
 			if err := runAction(ctx, action, info, data); err != nil {

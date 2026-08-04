@@ -23,4 +23,13 @@
 //
 // Keep state in Runtime. A second authoritative state field in the data passed
 // to Fire can disagree with it, especially on errors and panics.
+//
+// [NewWithObservers] attaches immutable observers to the Runtime. Every
+// non-self committed item emits an exit and entry before the next follow-up
+// begins. All Steps in one Run share the Run identifier of its first non-empty
+// Step; a self-transition root can therefore be silent while a changing
+// follow-up establishes that identifier. Observer delivery is synchronous but
+// isolated from the Run outcome. Its context preserves cancellation and values,
+// rejects Runtime.Fire as reentrant, and deliberately refuses Enqueue so
+// observation cannot extend the Run.
 package queued

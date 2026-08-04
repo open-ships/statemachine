@@ -376,6 +376,115 @@ func TestInstanceSelfTransitionRunsEveryTime(t *testing.T) {
 	}
 }
 
+func TestInstanceObservesCommittedPositionChanges(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "request")
+	data := &instanceData{}
+	var instance *statemachine.Instance[instanceState, instanceEvent, *instanceData]
+	var observations []statemachine.Observation[instanceState, instanceEvent]
+	var observedStates []instanceState
+	var contexts []any
+	var observedData []*instanceData
+	var nestedErrors []error
+
+	observer := func(
+		observerCtx context.Context,
+		observation statemachine.Observation[instanceState, instanceEvent],
+		observed *instanceData,
+	) {
+		observations = append(observations, observation)
+		observedStates = append(observedStates, instance.State())
+		contexts = append(contexts, observerCtx.Value(contextKey{}))
+		observedData = append(observedData, observed)
+		_, err := instance.Fire(observerCtx, instanceFinish, observed)
+		nestedErrors = append(nestedErrors, err)
+	}
+
+	selfCalls := 0
+	m := statemachine.MustCompile([]instanceRow{
+		{From: instanceIdle, Event: instanceStart, To: instanceActive},
+		{From: instanceActive, Event: instancePing, To: instanceActive, Do: func(context.Context, *instanceData) error {
+			selfCalls++
+			return nil
+		}},
+		{From: instanceActive, Event: instanceFinish, To: instanceDone},
+	})
+	instance = statemachine.NewInstanceWithObservers(m, instanceIdle, nil, observer)
+
+	if got, err := instance.Fire(ctx, instanceStart, data); err != nil || got != instanceActive {
+		t.Fatalf("start = (%v, %v)", got, err)
+	}
+	if got, err := instance.Fire(ctx, instancePing, data); err != nil || got != instanceActive {
+		t.Fatalf("self = (%v, %v)", got, err)
+	}
+	if got, err := instance.Fire(ctx, instanceFinish, data); err != nil || got != instanceDone {
+		t.Fatalf("finish = (%v, %v)", got, err)
+	}
+
+	want := []statemachine.Observation[instanceState, instanceEvent]{
+		{Seq: 1, Step: 1, Run: 1, Remaining: 1, Move: statemachine.Exited, State: instanceIdle, Event: instanceStart},
+		{Seq: 2, Step: 1, Run: 1, Move: statemachine.Entered, State: instanceActive, Event: instanceStart},
+		{Seq: 3, Step: 3, Run: 3, Remaining: 1, Move: statemachine.Exited, State: instanceActive, Event: instanceFinish},
+		{Seq: 4, Step: 3, Run: 3, Move: statemachine.Entered, State: instanceDone, Event: instanceFinish},
+	}
+	if !slices.Equal(observations, want) {
+		t.Fatalf("observations = %+v, want %+v", observations, want)
+	}
+	if !slices.Equal(observedStates, []instanceState{instanceActive, instanceActive, instanceDone, instanceDone}) {
+		t.Fatalf("observer states = %v", observedStates)
+	}
+	for index := range observations {
+		if contexts[index] != "request" || observedData[index] != data || nestedErrors[index] != statemachine.ErrInFlight {
+			t.Errorf("callback[%d] = context %v, data %p, nested %v", index, contexts[index], observedData[index], nestedErrors[index])
+		}
+	}
+	if selfCalls != 1 {
+		t.Fatalf("self transition ran %d effects, want 1", selfCalls)
+	}
+}
+
+func TestInstanceObserverFailuresAreIsolated(t *testing.T) {
+	m := statemachine.MustCompile([]instanceRow{{From: instanceIdle, Event: instanceStart, To: instanceActive}})
+	var delivered []statemachine.Observation[instanceState, instanceEvent]
+	panicCalls := 0
+	goexitCalls := 0
+	combined := statemachine.Observers(
+		func(context.Context, statemachine.Observation[instanceState, instanceEvent], *instanceData) {
+			panic("observer panic")
+		},
+		func(context.Context, statemachine.Observation[instanceState, instanceEvent], *instanceData) {
+			runtime.Goexit()
+		},
+		func(_ context.Context, observation statemachine.Observation[instanceState, instanceEvent], _ *instanceData) {
+			delivered = append(delivered, observation)
+		},
+	)
+	instance := statemachine.NewInstanceWithObservers(
+		m,
+		instanceIdle,
+		func(context.Context, statemachine.Observation[instanceState, instanceEvent], *instanceData) {
+			panicCalls++
+			panic("direct observer panic")
+		},
+		func(context.Context, statemachine.Observation[instanceState, instanceEvent], *instanceData) {
+			goexitCalls++
+			runtime.Goexit()
+		},
+		combined,
+	)
+
+	got, err := instance.Fire(context.Background(), instanceStart, &instanceData{})
+	if err != nil || got != instanceActive {
+		t.Fatalf("Fire = (%v, %v), want (%v, nil)", got, err, instanceActive)
+	}
+	if len(delivered) != 2 || delivered[1].Remaining != 0 {
+		t.Fatalf("delivered = %+v", delivered)
+	}
+	if panicCalls != 2 || goexitCalls != 2 {
+		t.Fatalf("failed observer calls = panic %d, Goexit %d; want 2 each", panicCalls, goexitCalls)
+	}
+}
+
 func TestInstancesOwnIndependentStateAndCopyMachineValue(t *testing.T) {
 	m := statemachine.MustCompile([]instanceRow{
 		{From: instanceIdle, Event: instanceStart, To: instanceActive},
@@ -505,5 +614,34 @@ func TestInstancePermittedIsAnEagerOrderedSnapshot(t *testing.T) {
 	}
 	if !slices.Equal(calls, []instanceEvent{instanceStart, instanceFinish}) {
 		t.Errorf("Guards ran again during iteration: calls = %v", calls)
+	}
+}
+
+var benchmarkInstanceMachine = statemachine.MustCompile([]instanceRow{
+	{From: instanceIdle, Event: instanceStart, To: instanceActive},
+	{From: instanceActive, Event: instanceFinish, To: instanceIdle},
+})
+
+func BenchmarkInstanceFire(b *testing.B) {
+	instance := statemachine.NewInstance(benchmarkInstanceMachine, instanceIdle)
+	data := &instanceData{}
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = instance.Fire(context.Background(), instanceStart, data)
+		_, _ = instance.Fire(context.Background(), instanceFinish, data)
+	}
+}
+
+func BenchmarkInstanceFireObserved(b *testing.B) {
+	instance := statemachine.NewInstanceWithObservers(
+		benchmarkInstanceMachine,
+		instanceIdle,
+		func(context.Context, statemachine.Observation[instanceState, instanceEvent], *instanceData) {},
+	)
+	data := &instanceData{}
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = instance.Fire(context.Background(), instanceStart, data)
+		_, _ = instance.Fire(context.Background(), instanceFinish, data)
 	}
 }
