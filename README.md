@@ -25,8 +25,10 @@ One definition can serve a million aggregates and any number of goroutines. When
 own execution state instead, construct one `Instance` per aggregate. The [`queued`](queued) package
 adds serialized run-to-completion execution, [`persist`](persist) runs the flat definition inside an
 adapter-owned unit of work, and [`statechart`](statechart) supplies hierarchy and lifecycle actions.
-A transactional `persist.Store` can pass its transaction through to effects. These modules remain
-separate because they have different concurrency and failure semantics.
+A transactional `persist.Store` can pass its transaction through to effects. The
+[`supervised`](supervised) package adds a strict Issue–Verify protocol, mandatory checks, finite
+execution limits, startup reconciliation, and latched faults for safety-adjacent orchestration.
+These modules remain separate because they have different concurrency, commit, and failure semantics.
 
 ## Hello world
 
@@ -157,6 +159,13 @@ are required. Runnable flat-machine examples are in [`example_test.go`](example_
 | Follow-up events and FIFO serialization | `queued.Runtime` | owned state; each root run drains to completion |
 | Database state and outbox work | `persist.Fire` | transactional when the Store supplies a transaction; never auto-retried |
 | Hierarchy, initial substates, entry/exit, reentry | `statechart` | immutable chart plus one stateful instance per aggregate |
+| Explicit issue/verification and latched faults | `supervised.Supervisor` | stopped until reconciled; one bounded Attempt; destination commits only after verification |
+
+The supervised module is not a safety-rated controller. It cannot terminate a callback that ignores
+cancellation or replace independent emergency stop, safe torque off, guarding, collision protection,
+or human-presence separation. Its detailed operating assumptions and prohibited uses are in
+[`SAFETY.md`](SAFETY.md). Its strict Machine exposes states, events, transition metadata, explicit
+refusals, and deterministic Graphviz DOT output without exposing callback values.
 
 A queued callback schedules same-runtime follow-ups with `queued.Enqueue` and the context it was
 given. It must never synchronously call `Runtime.Fire`; replacing that context defeats deadlock

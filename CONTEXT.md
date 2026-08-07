@@ -44,6 +44,22 @@ _Avoid_: Run, transaction
 An immutable projection of one Statechart's hierarchy at one committed active state.
 _Avoid_: Instance, registry
 
+**Supervisor**:
+One bounded execution of a strict flat definition that separates command issue from verification and latches execution faults.
+_Avoid_: Runtime, safety controller
+
+**Attempt**:
+One event accepted by a Supervisor for selection, issue, and optional verification under a single identifier.
+_Avoid_: Run, Step
+
+**Verification**:
+One mandatory check of fresh application evidence before an issued Attempt may commit.
+_Avoid_: Acknowledgement, confirmation
+
+**Fault**:
+A first-cause execution failure that prevents a Supervisor from accepting another Attempt until reconciliation succeeds.
+_Avoid_: Error, state
+
 ## Relationships
 
 - One **Machine** is shared by zero or more **Instances** and **Runtimes**.
@@ -60,6 +76,11 @@ _Avoid_: Instance, registry
 - One committed position change produces zero or one Step. Flat self-transitions and Statechart internal transitions produce none.
 - A Runtime Run may contain zero or more Steps. Its Run identifier is the Step identifier of its first non-empty Step.
 - A **Position** contains one active state, zero or more enclosing ancestors, and no execution registry.
+- One **Supervisor** owns exactly one committed state, zero or one pending Attempt, and zero or one latched Fault.
+- One strict Machine definition may be shared by zero or more **Supervisors**.
+- One **Attempt** issues at most one selected transition and commits it only after its verification succeeds.
+- An issued **Attempt** has exactly one successful **Verification**; a purely logical Attempt has none.
+- A **Fault** is not a Machine state and does not claim that an external system reached any physical condition.
 
 ## Example dialogue
 
@@ -70,3 +91,4 @@ _Avoid_: Instance, registry
 
 - "state machine" previously meant both the immutable transition definition and a running state owner — resolved: **Machine** is the definition; **Instance** or **Runtime** owns execution state.
 - "global current status" may mean one execution's complete Position or a census across many executions. This repository provides the former and Observation deltas for building the latter; it does not own a registry of executions.
+- "confirmed" in persist means only that Store.Update returned success; physical completion in supervised execution is a **Verification**.
