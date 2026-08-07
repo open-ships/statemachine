@@ -32,7 +32,10 @@
 // a flat machine with row effects. The queued subpackage adds serialized
 // run-to-completion cascades, persist places Machine.Fire inside an
 // adapter-owned unit of work, and statechart supplies hierarchy, initial
-// substates, lifecycle actions, and explicit transition kinds.
+// substates, lifecycle actions, and explicit transition kinds. The supervised
+// subpackage supplies a separate strict definition with mandatory checks,
+// explicit issue and verification, finite time limits, startup reconciliation,
+// and first-cause fault latching for safety-adjacent orchestration.
 //
 // # Declaring a machine
 //
