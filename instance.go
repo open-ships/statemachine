@@ -132,7 +132,7 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error
 	i.mu.Unlock()
 
 	if len(observers) != 0 {
-		deliverTransitionObservations(observers, ctx, step, step, from, next, event, data)
+		err = errors.Join(err, deliverTransitionObservations(observers, ctx, step, step, from, next, event, data))
 	}
 
 	return committed, err

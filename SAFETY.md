@@ -14,7 +14,7 @@ A committed state is a software fact. It is not evidence that an actuator moved,
 
 An external transition is split deliberately:
 
-1. `Supervisor.Issue` selects the row, runs mandatory checks, and calls `Issue` without committing its destination.
+1. `Supervisor.Issue` selects the row, runs mandatory checks, durably prepares an in-doubt Snapshot when a Journal is configured, and calls `Issue` without committing its destination.
 2. The application obtains fresh controller and sensor evidence.
 3. `Supervisor.Verify` runs the transition's verification, rechecks invariants and postconditions, and only then commits.
 
@@ -36,9 +36,25 @@ Supervisor Preconditions, transition Preconditions, Invariants, Verify, Postcond
 
 A new or restored Supervisor starts stopped. `Start` runs every Reconciler before accepting an Attempt. Restoration validates the definition ID and declared state, but the application must reconcile that logical Snapshot with controller, brake, sensor, calibration, firmware, and durable state.
 
-Recovery preserves the first Fault until all Reconcile checks pass. It is rejected while a timed-out callback still runs. A successful recovery clears the software latch; it does not itself reset an independent safety controller or authorize motion.
+Recovery preserves the first Fault until all Reconcile checks pass. It is rejected while the prior Operation call or any callback it started remains live. A successful recovery clears the software latch; it does not erase Lifecycle Records, reset an independent safety controller, or authorize motion.
+
+Snapshots carry a non-reusable Execution ID, the Attempt high-water mark, typed identity and timing for an in-doubt Change, and fault metadata. A restored in-doubt Snapshot is Faulted and requires Recover; the library never replays it. Require a durable Journal before external Issue when reuse of an Attempt after process loss is unacceptable. The Journal prepare occurs before the application Issue callback; controller-side command idempotency and fencing are still required for crash consistency across the software/controller seam.
 
 Use a stable Definition ID tied to the deployed transition definition and application build. Definition changes require an explicit Snapshot migration and renewed validation. Do not silently restore a Snapshot under different behavior.
+
+## Authority, fencing, and composition
+
+Supervisor locking is process-local. It does not prove that this process is the exclusive writer for an actuator, coordinate several Supervisors atomically, or authenticate an operator.
+
+A deployed system must provide stable vessel/aggregate/actuator identity, an external exclusive lease or leader, a durable monotonic fencing token, controller rejection of stale fences, command expiry and idempotency, replay protection, and coherent cross-subsystem evidence. Carry the Supervisor Execution ID and Attempt ID into those protocols for correlation. Never treat acceptance by this library as command authorization or exclusive plant ownership.
+
+## Records and observer failures
+
+Configure a Supervisor Recorder for durable Lifecycle Records. The in-process history includes asynchronous verification expiry, Trip, Recover, and secondary causes; `Status.RecorderError` makes a recorder failure visible. A Recorder is bounded by its configured timeout, but Go still cannot terminate a blocked Recorder goroutine.
+
+Instance, Runtime, and Statechart Observer panic or runtime.Goexit failures are contained, retain their original stack, and are returned as errors matching `statemachine.ErrObserverFailed` after the state change commits. Callers must inspect that error and alert or persist it; the committed state remains authoritative.
+
+Queued Runtime uses finite root and cumulative Run limits. Context cancellation can remove a root that has not started. These resource controls bound library work, not callback memory, controller queues, or external work launched by callbacks.
 
 ## Assurance expectations
 

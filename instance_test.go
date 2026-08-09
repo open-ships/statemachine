@@ -427,6 +427,14 @@ func TestInstanceObservesCommittedPositionChanges(t *testing.T) {
 		{Seq: 3, Step: 3, Run: 3, Remaining: 1, Move: statemachine.Exited, State: instanceActive, Event: instanceFinish},
 		{Seq: 4, Step: 3, Run: 3, Move: statemachine.Entered, State: instanceDone, Event: instanceFinish},
 	}
+	for index := range observations {
+		if observations[index].At.IsZero() || (index%2 == 1 && observations[index].At != observations[index-1].At) {
+			t.Fatalf("observation timestamps = %+v", observations)
+		}
+	}
+	for index := range observations {
+		observations[index].At = want[index].At
+	}
 	if !slices.Equal(observations, want) {
 		t.Fatalf("observations = %+v, want %+v", observations, want)
 	}
@@ -474,8 +482,9 @@ func TestInstanceObserverFailuresAreIsolated(t *testing.T) {
 	)
 
 	got, err := instance.Fire(context.Background(), instanceStart, &instanceData{})
-	if err != nil || got != instanceActive {
-		t.Fatalf("Fire = (%v, %v), want (%v, nil)", got, err, instanceActive)
+	var observerErr *statemachine.ObserverError
+	if !errors.Is(err, statemachine.ErrObserverFailed) || !errors.As(err, &observerErr) || observerErr.Stack == "" || got != instanceActive {
+		t.Fatalf("Fire = (%v, %v), want committed state and ObserverError", got, err)
 	}
 	if len(delivered) != 2 || delivered[1].Remaining != 0 {
 		t.Fatalf("delivered = %+v", delivered)

@@ -3,6 +3,7 @@ package persist_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,8 +27,41 @@ type tx struct {
 }
 
 type command struct {
-	tx     *tx
-	effect func() error
+	tx *tx
+}
+
+type brokenStore struct {
+	repeat     bool
+	concurrent bool
+	skip       bool
+}
+
+func (s brokenStore) Update(
+	ctx context.Context,
+	_ string,
+	step func(context.Context, state, struct{}) (state, error),
+) (state, error) {
+	if s.skip {
+		return draft, nil
+	}
+	if !s.repeat {
+		return step(ctx, draft, struct{}{})
+	}
+	if !s.concurrent {
+		first, _ := step(ctx, draft, struct{}{})
+		_, _ = step(ctx, draft, struct{}{}) // deliberately swallow the contract error
+		return first, nil
+	}
+	var wait sync.WaitGroup
+	wait.Add(2)
+	for range 2 {
+		go func() {
+			defer wait.Done()
+			_, _ = step(ctx, draft, struct{}{})
+		}()
+	}
+	wait.Wait()
+	return paid, nil
 }
 
 func machine(effect func(context.Context, *command) error) *statemachine.Machine[state, event, *command] {
@@ -57,6 +91,44 @@ func TestFireUsesStoreUnitAndCommitsState(t *testing.T) {
 	snapshot, err := store.Load(context.Background(), "A")
 	if err != nil || snapshot.State != paid || snapshot.Revision != 1 {
 		t.Fatalf("Load = %+v, %v", snapshot, err)
+	}
+}
+
+func TestStoreCallbackContractIsEnforced(t *testing.T) {
+	for _, concurrent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("concurrent=%v", concurrent), func(t *testing.T) {
+			var effects atomic.Int64
+			m := machine(func(context.Context, *command) error {
+				effects.Add(1)
+				return nil
+			})
+			result, err := persist.Step(
+				context.Background(), brokenStore{repeat: true, concurrent: concurrent}, "A", m, pay,
+				func(struct{}) *command { return &command{} },
+			)
+			if !errors.Is(err, persist.ErrStoreContract) || !errors.Is(err, persist.ErrStepRepeated) {
+				t.Fatalf("Step error = %v", err)
+			}
+			if effects.Load() != 1 || result.Confirmed {
+				t.Fatalf("effects/result = %d/%+v", effects.Load(), result)
+			}
+		})
+	}
+
+	result, err := persist.Step(
+		context.Background(), brokenStore{skip: true}, "A", machine(nil), pay,
+		func(struct{}) *command { return &command{} },
+	)
+	if !errors.Is(err, persist.ErrStoreContract) || !errors.Is(err, persist.ErrStepNotCalled) || result.Attempted || result.Confirmed {
+		t.Fatalf("skipped Step = %+v, %v", result, err)
+	}
+}
+
+func TestMemoryStoreRejectsDynamicallyUncomparableKey(t *testing.T) {
+	store := persist.NewMemoryStore[any, state](map[any]state{})
+	key := any([]int{1})
+	if _, err := store.Load(context.Background(), key); !errors.Is(err, persist.ErrInvalidKey) {
+		t.Fatalf("Load = %v", err)
 	}
 }
 

@@ -1,74 +1,95 @@
 name: Release
 
-# A successful CI run on the current main commit is the only release path.
-# VERSION sets the next deliberate baseline; later releases increment patch.
+# Releases are deliberate: a maintainer first creates and pushes a signed,
+# annotated tag whose version exactly matches VERSION. Protect the `release`
+# environment with required reviewers.
 on:
-  workflow_run:
-    workflows: [CI]
-    branches: [main]
-    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Signed annotated tag to publish (for example v2.0.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 concurrency:
-  group: release
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
   release:
-    runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    environment: release
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Checkout signed tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ inputs.tag }}
 
-      - name: Compute release version
-        id: version
+      - name: Verify version, ancestry, and signed annotated tag
+        env:
+          TAG: ${{ inputs.tag }}
+          RELEASE_SIGNING_PUBLIC_KEY: ${{ vars.RELEASE_SIGNING_PUBLIC_KEY }}
         run: |
-          git fetch origin main --tags
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
-            echo "A newer main commit superseded this CI run; nothing to release."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if git describe --tags --exact-match --match 'v*.*.*' HEAD >/dev/null 2>&1; then
-            echo "HEAD is already tagged; nothing to release."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          test -n "$RELEASE_SIGNING_PUBLIC_KEY"
+          printf '%s' "$RELEASE_SIGNING_PUBLIC_KEY" | gpg --batch --import
+          test "$(git cat-file -t "refs/tags/$TAG")" = tag
+          git verify-tag "$TAG"
+          test "$TAG" = "v$(tr -d '[:space:]' < VERSION)"
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
 
-          BASE_VERSION=$(tr -d '[:space:]' < VERSION)
-          if ! echo "$BASE_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "VERSION must contain a semantic version without a leading v." >&2
-            exit 1
-          fi
-          BASE_TAG="v$BASE_VERSION"
-          LATEST=$(git tag --list 'v*.*.*' | sort -V | tail -n 1)
-          if [ -z "$LATEST" ]; then
-            TAG="$BASE_TAG"
-          elif [ "$LATEST" != "$BASE_TAG" ] && [ "$(printf '%s\n%s\n' "$LATEST" "$BASE_TAG" | sort -V | tail -n 1)" = "$BASE_TAG" ]; then
-            TAG="$BASE_TAG"
-          else
-            TAG=$(echo "$LATEST" | awk -F '[v.]' '{printf "v%d.%d.%d", $2, $3, $4 + 1}')
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Set up exact Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.0"
 
-      - name: Create and push tag
-        if: ${{ steps.version.outputs.skip != 'true' }}
+      - name: Verify source
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
+          go vet ./...
+          go run github.com/kisielk/errcheck@v1.20.0 ./...
+          go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+          go test -race -coverprofile=coverage.out ./...
+          COVERAGE=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
+          awk -v coverage="$COVERAGE" 'BEGIN { if (coverage < 90) exit 1 }'
+          go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+          test ! -f go.sum
+          test -z "$(gofmt -l .)"
 
-      - name: Publish GitHub release
-        if: ${{ steps.version.outputs.skip != 'true' }}
+      - name: Build source artifact
+        env:
+          TAG: ${{ inputs.tag }}
+        run: git archive --format=tar.gz --prefix="statemachine-$TAG/" --output=source.tar.gz HEAD
+
+      - name: Record toolchain
+        run: |
+          go version > toolchain.txt
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN >> toolchain.txt
+          git rev-parse HEAD >> toolchain.txt
+
+      - name: Generate CycloneDX SBOM
+        run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output sbom.json
+
+      - name: Checksums
+        run: sha256sum source.tar.gz coverage.out toolchain.txt sbom.json > SHA256SUMS
+
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: source.tar.gz
+          sbom-path: sbom.json
+
+      - name: Publish release with retained evidence
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.version.outputs.tag }}
-        run: gh release create "$TAG" --generate-notes --title "$TAG"
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release create "$TAG" source.tar.gz coverage.out toolchain.txt sbom.json SHA256SUMS \
+            --generate-notes --title "$TAG" --verify-tag

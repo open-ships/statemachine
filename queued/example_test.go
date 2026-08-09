@@ -22,12 +22,13 @@ func Example() {
 		Capture   Event = "capture"
 	)
 
+	var run *queued.Runtime[State, Event, *Command]
 	machine := statemachine.MustCompile([]statemachine.Transition[State, Event, *Command]{
 		{
 			From: Pending, Event: Authorize, To: Authorized,
 			Do: func(ctx context.Context, command *Command) error {
 				command.Trace = append(command.Trace, "authorized")
-				return queued.Enqueue(ctx, Capture, command)
+				return run.Enqueue(ctx, Capture, command)
 			},
 		},
 		{
@@ -39,7 +40,7 @@ func Example() {
 		},
 	})
 
-	run := queued.New(machine, Pending)
+	run = queued.New(machine, Pending)
 	command := &Command{}
 	state, err := run.Fire(context.Background(), Authorize, command)
 	fmt.Println(state, err)

@@ -685,7 +685,7 @@ func BenchmarkFireAccepted(b *testing.B) {
 	d := data{lines: 1, inStock: true}
 	b.ReportAllocs()
 	for b.Loop() {
-		benchMachine.Fire(ctx(), paid, ship, &d)
+		_, _ = benchMachine.Fire(ctx(), paid, ship, &d)
 	}
 }
 
@@ -695,7 +695,7 @@ func BenchmarkFireDefaultArm(b *testing.B) {
 	d := data{}
 	b.ReportAllocs()
 	for b.Loop() {
-		benchMachine.Fire(ctx(), paid, ship, &d)
+		_, _ = benchMachine.Fire(ctx(), paid, ship, &d)
 	}
 }
 
@@ -705,7 +705,7 @@ func BenchmarkFireRefused(b *testing.B) {
 	d := data{}
 	b.ReportAllocs()
 	for b.Loop() {
-		benchMachine.Fire(ctx(), shipped, pay, &d)
+		_, _ = benchMachine.Fire(ctx(), shipped, pay, &d)
 	}
 }
 
@@ -741,5 +741,43 @@ func BenchmarkCompile(b *testing.B) {
 		if _, err := statemachine.Compile(table); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestStrictComparableTypesAndDynamicValuesNeverPanic(t *testing.T) {
+	if _, err := statemachine.Compile([]statemachine.Transition[any, event, *data]{
+		{From: "idle", Event: submit, To: "running"},
+	}); err == nil || !strings.Contains(err.Error(), "state type must not contain an interface") {
+		t.Fatalf("interface state Compile = %v", err)
+	}
+	type nested struct{ Value any }
+	if _, err := statemachine.Compile([]statemachine.Transition[nested, event, *data]{
+		{From: nested{Value: []int{1}}, Event: submit, To: nested{Value: "running"}},
+	}); err == nil || !strings.Contains(err.Error(), "state type must not contain an interface") {
+		t.Fatalf("nested interface Compile = %v", err)
+	}
+	var zero statemachine.Machine[any, any, struct{}]
+	if _, err := zero.Fire(context.Background(), any([]int{1}), "start", struct{}{}); !errors.Is(err, statemachine.ErrInvalidKey) {
+		t.Fatalf("zero Fire = %v", err)
+	}
+}
+
+func TestMoveAndObserverFailureDiagnostics(t *testing.T) {
+	if statemachine.Exited.String() != "exited" || statemachine.Entered.String() != "entered" ||
+		statemachine.Move(255).String() != "Move(255)" {
+		t.Fatalf("Move strings = %q, %q, %q", statemachine.Exited, statemachine.Entered, statemachine.Move(255))
+	}
+	panicked := &statemachine.ObserverError{Observer: 2, Seq: 7, Value: "boom"}
+	stopped := &statemachine.ObserverError{Observer: 3, Seq: 8, Stopped: true}
+	if !errors.Is(panicked, statemachine.ErrObserverFailed) || !strings.Contains(panicked.Error(), "boom") ||
+		!errors.Is(stopped, statemachine.ErrObserverFailed) || !strings.Contains(stopped.Error(), "stopped") {
+		t.Fatalf("Observer errors = %v / %v", panicked, stopped)
+	}
+	var nilFailure *statemachine.ObserverError
+	if nilFailure.Error() != "<nil>" {
+		t.Fatalf("nil ObserverError = %q", nilFailure.Error())
+	}
+	if statemachine.Observers[state, event, *data](nil) != nil {
+		t.Fatal("Observers(nil) must be nil")
 	}
 }

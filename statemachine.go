@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"iter"
 	"strings"
+
+	"github.com/open-ships/statemachine/internal/keycheck"
 )
 
 // ErrNotPermitted reports that no transition applied: either no row of the
@@ -26,7 +28,12 @@ import (
 // another Machine and returns that call's refusal will make errors.Is report a
 // refusal for a transition this Machine permitted. Wrapping with %w does not
 // help — it preserves the sentinel. Return a different error instead.
-var ErrNotPermitted = errors.New("transition not permitted")
+var (
+	ErrNotPermitted = errors.New("transition not permitted")
+	// ErrInvalidKey reports a state or event value that cannot safely be used
+	// as a map key because it contains an uncomparable dynamic value.
+	ErrInvalidKey = errors.New("statemachine: state or event is not strictly comparable")
+)
 
 // A Transition is one row of a transition table: in state From, event Event
 // moves the machine to state To.
@@ -100,10 +107,11 @@ type key[S, E comparable] struct {
 // are the caller's to synchronize. The zero Machine has no rows and refuses
 // every event.
 //
-// S and E must be strictly comparable. Go's comparable constraint is also
-// satisfied by interface types, and a Machine whose S or E is an interface
-// panics when a value's dynamic type is not comparable — the same panic a map
-// index gives. Use a defined string or integer type.
+// S and E must be strictly comparable. Go's comparable constraint also admits
+// interface-bearing types; Compile rejects them before building any map. A
+// zero Machine reports [ErrInvalidKey] from Fire for an uncomparable dynamic
+// value, while Permitted returns an empty sequence. Prefer distinct defined
+// string or integer types for S and E.
 type Machine[S, E comparable, T any] struct {
 	rows   map[key[S, E]][]Transition[S, E, T]
 	events map[S][]E // per state, each event once, in first-mention order
@@ -129,6 +137,12 @@ type Machine[S, E comparable, T any] struct {
 //	var empty []row
 //	m, err := statemachine.Compile(empty)
 func Compile[S, E comparable, T any](transitions []Transition[S, E, T]) (*Machine[S, E, T], error) {
+	if !keycheck.StrictType[S]() {
+		return nil, errors.New("statemachine: state type must not contain an interface")
+	}
+	if !keycheck.StrictType[E]() {
+		return nil, errors.New("statemachine: event type must not contain an interface")
+	}
 	m := &Machine[S, E, T]{
 		rows:   make(map[key[S, E]][]Transition[S, E, T], len(transitions)),
 		events: make(map[S][]E),
@@ -206,6 +220,9 @@ func MustCompile[S, E comparable, T any](transitions []Transition[S, E, T]) *Mac
 // distinct aggregates, and never fire the machine that owns the state the
 // current transition is advancing.
 func (m *Machine[S, E, T]) Fire(ctx context.Context, from S, event E, data T) (S, error) {
+	if !keycheck.Value(from) || !keycheck.Value(event) {
+		return from, ErrInvalidKey
+	}
 	var reasons []error
 	for _, t := range m.rows[key[S, E]{from, event}] {
 		if t.Guard != nil {
@@ -249,6 +266,9 @@ func (m *Machine[S, E, T]) Fire(ctx context.Context, from S, event E, data T) (S
 // [ErrNotPermitted] cannot go stale between the question and the answer.
 func (m *Machine[S, E, T]) Permitted(ctx context.Context, from S, data T) iter.Seq2[E, S] {
 	return func(yield func(E, S) bool) {
+		if !keycheck.Value(from) {
+			return
+		}
 		for _, event := range m.events[from] {
 			for _, t := range m.rows[key[S, E]{from, event}] {
 				if t.Guard != nil && t.Guard(ctx, data) != nil {

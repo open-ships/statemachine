@@ -36,7 +36,7 @@ func ExampleSupervisor() {
 		return nil
 	}
 	acceptChange := func(context.Context, supervised.Change[State, Event], IO) error { return nil }
-	reconcile := func(_ context.Context, snapshot supervised.Snapshot[State], io IO) error {
+	reconcile := func(_ context.Context, snapshot supervised.Snapshot[State, Event], io IO) error {
 		if snapshot.State == Work && !io.AtTarget {
 			return errors.New("logical and physical position disagree")
 		}
@@ -68,23 +68,34 @@ func ExampleSupervisor() {
 		Preconditions:  []supervised.Precondition[State, Event, IO]{requireInterlock},
 		Invariants:     []supervised.Check[State, Event, IO]{invariant},
 		Postconditions: []supervised.Check[State, Event, IO]{acceptChange},
-		Reconcile:      []supervised.Reconciler[State, IO]{reconcile},
+		Reconcile:      []supervised.Reconciler[State, Event, IO]{reconcile},
 	})
 
-	run, _ := supervised.New(machine, supervised.Limits{
+	run, err := supervised.New(machine, supervised.Limits{
 		OperationTimeout:    time.Second,
 		VerificationTimeout: 5 * time.Second,
 	})
-	_ = run.Start(context.Background(), IO{InterlockClosed: true})
+	if err != nil {
+		panic(err)
+	}
+	if _, err = run.Start(context.Background(), IO{InterlockClosed: true}); err != nil {
+		panic(err)
+	}
 	fmt.Println("start:", run.Status().Mode)
 
-	issued := run.Issue(context.Background(), Move, IO{InterlockClosed: true})
+	issued, err := run.Issue(context.Background(), Move, IO{InterlockClosed: true})
+	if err != nil {
+		panic(err)
+	}
 	fmt.Println("issue:", issued.TransitionID, issued.Committed)
 
-	committed := run.Verify(context.Background(), issued.Attempt, IO{
+	committed, err := run.Verify(context.Background(), issued.AttemptKey, IO{
 		InterlockClosed: true,
 		AtTarget:        true,
 	})
+	if err != nil {
+		panic(err)
+	}
 	fmt.Println("verify:", run.Snapshot().State, committed.Committed, committed.Revision)
 
 	// Output:

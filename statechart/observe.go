@@ -2,8 +2,11 @@ package statechart
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"github.com/open-ships/statemachine"
+	internalobserver "github.com/open-ships/statemachine/internal/observer"
 )
 
 // Observation is one committed Statechart node exit or entry. The embedded
@@ -20,8 +23,8 @@ type Observation[S, E comparable] struct {
 //
 // Delivery is synchronous and ordered by Seq, then observer attachment order,
 // but isolated: Fire waits for Observer to return, while a panic or
-// runtime.Goexit in Observer is contained and cannot replace an action error or
-// panic. Later deliveries are still attempted. One Observer attached to
+// runtime.Goexit in Observer is contained and reported as a post-commit error
+// matching statemachine.ErrObserverFailed. Later deliveries are still attempted. One Observer attached to
 // several Instances may be called concurrently and must synchronize any shared
 // mutable state.
 type Observer[S, E comparable, T any] func(context.Context, Observation[S, E], T)
@@ -33,8 +36,14 @@ func Observers[S, E comparable, T any](observers ...Observer[S, E, T]) Observer[
 		return nil
 	}
 	return func(ctx context.Context, observation Observation[S, E], data T) {
-		for _, observer := range observers {
-			callObserver(observer, ctx, observation, data)
+		var failures []error
+		for index, observer := range observers {
+			if err := callObserver(index, observer, ctx, observation, data); err != nil {
+				failures = append(failures, err)
+			}
+		}
+		if len(failures) != 0 {
+			panic(errors.Join(failures...))
 		}
 	}
 }
@@ -50,18 +59,20 @@ func copyObservers[S, E comparable, T any](observers []Observer[S, E, T]) []Obse
 }
 
 func callObserver[S, E comparable, T any](
+	index int,
 	observer Observer[S, E, T],
 	ctx context.Context,
 	observation Observation[S, E],
 	data T,
-) {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		defer func() { _ = recover() }()
-		observer(ctx, observation, data)
-	}()
-	<-done
+) error {
+	failure := internalobserver.Call(func() { observer(ctx, observation, data) })
+	if failure == nil {
+		return nil
+	}
+	return &statemachine.ObserverError{
+		Observer: index, Seq: observation.Seq, Value: failure.Value,
+		Stack: failure.Stack, Stopped: failure.Stopped,
+	}
 }
 
 func deliverTransitionObservations[S, E comparable, T any](
@@ -72,43 +83,35 @@ func deliverTransitionObservations[S, E comparable, T any](
 	event E,
 	info Info[S, E],
 	data T,
-) {
+) error {
 	nodeCount := len(exits) + len(entries)
 	if len(observers) == 0 || nodeCount == 0 {
-		return
+		return nil
 	}
-	total := len(observers) * nodeCount
-	for next := 0; next < total; {
-		done := make(chan struct{})
-		start := next
-		go func() {
-			defer close(done)
-			for index := start; index < total; index++ {
-				next = index + 1
-				func() {
-					defer func() { _ = recover() }()
-					nodeIndex := index / len(observers)
-					var state S
-					move := statemachine.Entered
-					if nodeIndex < len(exits) {
-						move = statemachine.Exited
-						state = exits[nodeIndex]
-					} else {
-						state = entries[nodeIndex-len(exits)]
-					}
-					observation := Observation[S, E]{
-						Observation: statemachine.Observation[S, E]{
-							Seq: step + uint64(nodeIndex), Step: step, Run: step,
-							Remaining: uint64(nodeCount - nodeIndex - 1),
-							Move:      move, State: state, Event: event,
-						},
-						Info: info,
-					}
-					observer := observers[index%len(observers)]
-					observer(ctx, observation, data)
-				}()
+	at := time.Now()
+	var failures []error
+	for nodeIndex := 0; nodeIndex < nodeCount; nodeIndex++ {
+		for observerIndex, observer := range observers {
+			var state S
+			move := statemachine.Entered
+			if nodeIndex < len(exits) {
+				move = statemachine.Exited
+				state = exits[nodeIndex]
+			} else {
+				state = entries[nodeIndex-len(exits)]
 			}
-		}()
-		<-done
+			observation := Observation[S, E]{
+				Observation: statemachine.Observation[S, E]{
+					Seq: step + uint64(nodeIndex), Step: step, Run: step,
+					Remaining: uint64(nodeCount - nodeIndex - 1),
+					At:        at, Move: move, State: state, Event: event,
+				},
+				Info: info,
+			}
+			if err := callObserver(observerIndex, observer, ctx, observation, data); err != nil {
+				failures = append(failures, err)
+			}
+		}
 	}
+	return errors.Join(failures...)
 }

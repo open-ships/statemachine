@@ -52,6 +52,14 @@ _Avoid_: Runtime, safety controller
 One event accepted by a Supervisor for selection, issue, and optional verification under a single identifier.
 _Avoid_: Run, Step
 
+**Operation**:
+One call to Start, Issue, Verify, or Recover together with every callback it starts. An Operation remains live until the call has returned and all detached callbacks have stopped.
+_Avoid_: Attempt, Run
+
+**Execution ID**:
+A durable, non-reusable identity for one Supervisor lineage. Attempt identity is the pair of Execution ID and sequence.
+_Avoid_: Definition ID, Revision
+
 **Verification**:
 One mandatory check of fresh application evidence before an issued Attempt may commit.
 _Avoid_: Acknowledgement, confirmation
@@ -59,6 +67,14 @@ _Avoid_: Acknowledgement, confirmation
 **Fault**:
 A first-cause execution failure that prevents a Supervisor from accepting another Attempt until reconciliation succeeds.
 _Avoid_: Error, state
+
+**Lifecycle Record**:
+One immutable, sequenced outcome in a Supervisor's execution history. Lifecycle Records describe attempts and faults; Observations describe committed node membership.
+_Avoid_: Observation, Fault
+
+**Journal**:
+A durable Adapter that saves an in-doubt Snapshot, including the typed Change and its timing, before an external Issue callback can run.
+_Avoid_: Store, Recorder
 
 ## Relationships
 
@@ -79,8 +95,12 @@ _Avoid_: Error, state
 - One **Supervisor** owns exactly one committed state, zero or one pending Attempt, and zero or one latched Fault.
 - One strict Machine definition may be shared by zero or more **Supervisors**.
 - One **Attempt** issues at most one selected transition and commits it only after its verification succeeds.
+- One **Operation** owns a non-reusable token. A revoked Operation retains that token until its call and callbacks finish, so stale continuations cannot mutate a later Operation.
+- A restored Supervisor preserves its **Execution ID**, Attempt high-water mark, and typed in-doubt Change evidence. An in-doubt or faulted Snapshot restores Faulted and must reconcile through Recover; it is never replayed automatically.
 - An issued **Attempt** has exactly one successful **Verification**; a purely logical Attempt has none.
 - A **Fault** is not a Machine state and does not claim that an external system reached any physical condition.
+- A configured **Journal** durably records an in-doubt Snapshot before Issue. Controller fencing and atomic plant commands remain external responsibilities.
+- Supervisor Lifecycle Records are never erased by Recover; a Recorder failure is exposed through Status.
 
 ## Example dialogue
 

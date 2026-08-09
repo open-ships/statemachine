@@ -135,10 +135,11 @@ The optional state-owning interface adds:
 
 An `Observation` names one exited or entered state. Its `Seq` is consecutive
 within one observed execution, `Step` groups the non-empty position change made
-by one event, and `Remaining == 0` closes that Step. Context and `T` are passed
+by one event, `Remaining == 0` closes that Step, and `At` timestamps its committed
+publication. Context and `T` are passed
 to the typed `Observer` separately. Observers run synchronously without an
 execution lock, but in isolation: an observer panic or `runtime.Goexit` cannot
-change the transition outcome. Flat self-transitions change no position and are
+reverse the committed transition and is returned as a post-commit error. Flat self-transitions change no position and are
 observation-silent. A shared observer can be called concurrently by different
 executions and must synchronize its own census or sink.
 
@@ -167,9 +168,15 @@ or human-presence separation. Its detailed operating assumptions and prohibited 
 [`SAFETY.md`](SAFETY.md). Its strict Machine exposes states, events, transition metadata, explicit
 refusals, and deterministic Graphviz DOT output without exposing callback values.
 
-A queued callback schedules same-runtime follow-ups with `queued.Enqueue` and the context it was
-given. It must never synchronously call `Runtime.Fire`; replacing that context defeats deadlock
-detection.
+Supervisor operations return `(Result, error)`, use non-reusable Execution ID plus sequence Attempt
+identity, and reject stale Verify calls across restoration. `NewWithOptions` adds deterministic Clock,
+durable pre-Issue Journal, and ordered lifecycle Recorder seams; asynchronous expiry and secondary
+causes remain available through `Records` after recovery.
+
+A queued callback schedules same-runtime follow-ups with `runtime.Enqueue` and the context it was
+given. Naming the Runtime makes cross-Runtime mistakes return `ErrWrongRuntime`; finite limits bound
+outstanding roots and cumulative Run work. It must never synchronously call `Runtime.Fire`;
+replacing that context defeats deadlock detection.
 
 Statechart inspection is split between immutable definition facts and one
 execution's current position. `Chart.States` enumerates compiled states,
@@ -196,7 +203,8 @@ For persistence, a getter and setter are not a transaction. A `persist.Store` mu
 write and must invoke the transition callback exactly once after a successful load. A transactional
 database Store should put aggregate changes and an outbox record in the same unit of work. Only work
 performed through that transaction is atomic. A conflict discovered after an effect is not retried;
-an application retry must reload and use a stable idempotency key.
+an application retry must reload and use a stable idempotency key. `persist.Fire` and `persist.Step`
+detect an Adapter that repeats or omits the callback and never execute a repeated transition step.
 `persist.Step` additionally reports the loaded From and attempted To, but only
 `StepResult.Confirmed` says the Store returned success; false is not proof that
 an external commit did not happen.

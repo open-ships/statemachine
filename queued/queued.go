@@ -25,7 +25,31 @@ var (
 	// currently running cascade. Execution contexts are valid for enqueueing
 	// only until their root Fire completes.
 	ErrNotRunning = errors.New("queued: no cascade is running in context")
+
+	// ErrWrongRuntime reports Enqueue with a callback context owned by a
+	// different Runtime.
+	ErrWrongRuntime = errors.New("queued: context belongs to another runtime")
+	// ErrRootLimit reports admission beyond a Runtime's outstanding-root limit.
+	ErrRootLimit = errors.New("queued: outstanding root limit reached")
+	// ErrRunLimit reports admission beyond one Run's cumulative event limit.
+	ErrRunLimit = errors.New("queued: run event limit reached")
+	// ErrInvalidLimits reports a non-positive queue resource limit.
+	ErrInvalidLimits = errors.New("queued: limits must be positive")
 )
+
+const (
+	DefaultMaxRoots     = 1024
+	DefaultMaxRunEvents = 4096
+)
+
+// Limits bounds outstanding external roots and cumulative events accepted by
+// one Run. MaxRunEvents includes the root event itself.
+type Limits struct {
+	MaxRoots     int
+	MaxRunEvents int
+}
+
+var defaultLimits = Limits{MaxRoots: DefaultMaxRoots, MaxRunEvents: DefaultMaxRunEvents}
 
 // A Runtime owns the current state of one aggregate and serializes events for
 // it. Its Machine remains immutable and may be shared with other runtimes.
@@ -35,23 +59,45 @@ var (
 // used instead. A Runtime must not be copied after first use.
 //
 // Each external Fire is one root cascade. External roots run in FIFO order;
-// events appended by Enqueue finish before the next root begins. Runtime does
+// events appended by Runtime.Enqueue finish before the next root begins. Runtime does
 // not keep a permanent worker goroutine: the goroutine that drains roots exits
 // whenever the root queue becomes empty.
 type Runtime[S, E comparable, T any] struct {
 	mu        sync.Mutex
-	machine   *statemachine.Machine[S, E, T]
+	machine   statemachine.Machine[S, E, T]
 	state     S
 	roots     []*root[E, T, S]
 	running   bool
+	limits    Limits
+	rootCount int
 	observers []statemachine.Observer[S, E, T]
 	seq       uint64
+}
+
+// Status is one atomic Runtime scheduling snapshot.
+type Status[S comparable] struct {
+	State            S
+	Running          bool
+	OutstandingRoots int
+	Limits           Limits
 }
 
 // New constructs a Runtime in initial state. A nil machine means the zero
 // Machine, which refuses every event.
 func New[S, E comparable, T any](machine *statemachine.Machine[S, E, T], initial S) *Runtime[S, E, T] {
-	return newRuntime(machine, initial, nil)
+	return newRuntime(machine, initial, defaultLimits, nil)
+}
+
+// NewWithLimits constructs a Runtime with explicit finite resource limits.
+func NewWithLimits[S, E comparable, T any](
+	machine *statemachine.Machine[S, E, T],
+	initial S,
+	limits Limits,
+) (*Runtime[S, E, T], error) {
+	if limits.MaxRoots <= 0 || limits.MaxRunEvents <= 0 {
+		return nil, ErrInvalidLimits
+	}
+	return newRuntime(machine, initial, limits, nil), nil
 }
 
 // NewWithObservers is like [New] and attaches observers for the lifetime of
@@ -62,17 +108,22 @@ func NewWithObservers[S, E comparable, T any](
 	initial S,
 	observers ...statemachine.Observer[S, E, T],
 ) *Runtime[S, E, T] {
-	return newRuntime(machine, initial, observers)
+	return newRuntime(machine, initial, defaultLimits, observers)
 }
 
 func newRuntime[S, E comparable, T any](
 	machine *statemachine.Machine[S, E, T],
 	initial S,
+	limits Limits,
 	observers []statemachine.Observer[S, E, T],
 ) *Runtime[S, E, T] {
-	return &Runtime[S, E, T]{
-		machine: machine, state: initial, observers: copyObservers(observers),
+	runtime := &Runtime[S, E, T]{
+		state: initial, limits: limits, observers: copyObservers(observers),
 	}
+	if machine != nil {
+		runtime.machine = *machine
+	}
+	return runtime
 }
 
 // State reports the last committed state. While a Guard or Do is running it
@@ -82,6 +133,21 @@ func (r *Runtime[S, E, T]) State() S {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.state
+}
+
+// Status reports committed state, scheduler activity, admitted roots, and
+// configured resource bounds atomically.
+func (r *Runtime[S, E, T]) Status() Status[S] {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	limits := r.limits
+	if limits.MaxRoots == 0 {
+		limits = defaultLimits
+	}
+	return Status[S]{
+		State: r.state, Running: r.running,
+		OutstandingRoots: r.rootCount, Limits: limits,
+	}
 }
 
 // Fire appends an external root event and waits for that root's entire cascade
@@ -104,12 +170,15 @@ func (r *Runtime[S, E, T]) State() S {
 // Runtime with that active context reports ErrReentrant. Never replace that
 // context and call Fire synchronously from a callback: doing so defeats the
 // detection and can deadlock behind the root that is waiting for the callback.
-// Call Enqueue with the supplied context for same-runtime follow-ups instead.
+// Call this Runtime's Enqueue with the supplied context for same-runtime follow-ups instead.
 func (r *Runtime[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error) {
 	if x, ok := executionFrom(ctx); ok && x.active() {
 		return r.State(), ErrReentrant
 	}
 
+	if err := ctx.Err(); err != nil {
+		return r.State(), err
+	}
 	req := &root[E, T, S]{
 		ctx:   ctx,
 		event: event,
@@ -118,7 +187,16 @@ func (r *Runtime[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error)
 	}
 
 	r.mu.Lock()
+	if r.limits.MaxRoots == 0 {
+		r.limits = defaultLimits
+	}
+	if r.rootCount >= r.limits.MaxRoots {
+		state := r.state
+		r.mu.Unlock()
+		return state, ErrRootLimit
+	}
 	r.roots = append(r.roots, req)
+	r.rootCount++
 	start := !r.running
 	if start {
 		r.running = true
@@ -129,11 +207,38 @@ func (r *Runtime[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error)
 		go r.drain()
 	}
 
-	result := <-req.done
+	var result outcome[S]
+	select {
+	case result = <-req.done:
+	case <-ctx.Done():
+		r.mu.Lock()
+		removed := r.removeRootLocked(req)
+		if removed {
+			r.rootCount--
+		}
+		r.mu.Unlock()
+		if removed {
+			return r.State(), ctx.Err()
+		}
+		result = <-req.done
+	}
 	if result.panicked {
 		panic(result.panicValue)
 	}
 	return result.state, result.err
+}
+
+func (r *Runtime[S, E, T]) removeRootLocked(target *root[E, T, S]) bool {
+	for index, candidate := range r.roots {
+		if candidate != target {
+			continue
+		}
+		copy(r.roots[index:], r.roots[index+1:])
+		r.roots[len(r.roots)-1] = nil
+		r.roots = r.roots[:len(r.roots)-1]
+		return true
+	}
+	return false
 }
 
 // Permitted reports an eager snapshot of the events accepted in the last
@@ -153,15 +258,8 @@ func (r *Runtime[S, E, T]) Permitted(ctx context.Context, data T) iter.Seq2[E, S
 		to    S
 	}
 	var snapshot []pair
-	if machine == nil {
-		var zero statemachine.Machine[S, E, T]
-		for event, to := range zero.Permitted(ctx, state, data) {
-			snapshot = append(snapshot, pair{event, to})
-		}
-	} else {
-		for event, to := range machine.Permitted(ctx, state, data) {
-			snapshot = append(snapshot, pair{event, to})
-		}
+	for event, to := range machine.Permitted(ctx, state, data) {
+		snapshot = append(snapshot, pair{event, to})
 	}
 
 	return func(yield func(E, S) bool) {
@@ -173,19 +271,21 @@ func (r *Runtime[S, E, T]) Permitted(ctx context.Context, data T) iter.Seq2[E, S
 	}
 }
 
-// Enqueue appends event to the cascade identified by ctx. It does not wait for
+// Enqueue appends event to this Runtime's cascade identified by ctx. It does not wait for
 // the event to run. The event receives ctx when it later runs, so cancellation
 // of either the root context or this context skips it and aborts the remaining
 // follow-ups in that root. Enqueue must complete before the callback returns;
 // if a callback starts enqueueing goroutines, it must join them before return.
 //
-// Enqueue reports ErrNotRunning when ctx did not come from a currently running
-// Runtime callback, when that cascade has already finished, or when event and
-// data are not assignable to that Runtime's E and T types.
-func Enqueue[E comparable, T any](ctx context.Context, event E, data T) error {
+// Enqueue reports ErrWrongRuntime when ctx belongs to another Runtime and
+// ErrNotRunning when its Run is absent or complete.
+func (r *Runtime[S, E, T]) Enqueue(ctx context.Context, event E, data T) error {
 	x, ok := executionFrom(ctx)
-	if !ok {
+	if !ok || !x.active() {
 		return ErrNotRunning
+	}
+	if x.owner != r {
+		return ErrWrongRuntime
 	}
 	return x.enqueue(ctx, event, data)
 }
@@ -214,9 +314,11 @@ type item[E comparable, T any] struct {
 // that the effect joins before returning. The runtime mutex is never held while
 // user code runs.
 type cascade[E comparable, T any] struct {
-	mu      sync.Mutex
-	active  bool
-	pending []item[E, T]
+	mu       sync.Mutex
+	active   bool
+	pending  []item[E, T]
+	accepted int
+	maximum  int
 }
 
 func (c *cascade[E, T]) enqueue(ctx context.Context, event E, data T) error {
@@ -225,7 +327,11 @@ func (c *cascade[E, T]) enqueue(ctx context.Context, event E, data T) error {
 	if !c.active {
 		return ErrNotRunning
 	}
+	if c.accepted >= c.maximum {
+		return ErrRunLimit
+	}
 	c.pending = append(c.pending, item[E, T]{ctx: ctx, event: event, data: data})
+	c.accepted++
 	return nil
 }
 
@@ -259,6 +365,7 @@ func (c *cascade[E, T]) isActive() bool {
 type executionKey struct{}
 
 type execution struct {
+	owner   any
 	active  func() bool
 	enqueue func(context.Context, any, any) error
 }
@@ -305,7 +412,11 @@ func (r *Runtime[S, E, T]) drain() {
 		r.roots = r.roots[1:]
 		r.mu.Unlock()
 
-		req.done <- r.execute(req)
+		result := r.execute(req)
+		r.mu.Lock()
+		r.rootCount--
+		r.mu.Unlock()
+		req.done <- result
 	}
 }
 
@@ -329,9 +440,9 @@ func (r *Runtime[S, E, T]) execute(req *root[E, T, S]) outcome[S] {
 }
 
 func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
-	c := &cascade[E, T]{active: true}
+	c := &cascade[E, T]{active: true, accepted: 1, maximum: r.limits.MaxRunEvents}
 	var run uint64
-	x := &execution{active: c.isActive}
+	x := &execution{owner: r, active: c.isActive}
 	x.enqueue = func(ctx context.Context, event, data any) error {
 		typedEvent, ok := assign[E](event)
 		if !ok {
@@ -363,6 +474,7 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 
 	execCtx := context.WithValue(req.ctx, executionKey{}, x)
 	current := item[E, T]{ctx: execCtx, event: req.event, data: req.data}
+	var observerFailures []error
 
 	for {
 		if err := req.ctx.Err(); err != nil {
@@ -399,10 +511,12 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 		r.mu.Unlock()
 
 		if len(observers) != 0 {
-			observerCtx := observationContext(current.ctx, c.isActive)
-			deliverTransitionObservations(
+			observerCtx := observationContext(current.ctx, r, c.isActive)
+			if err := deliverTransitionObservations(
 				observers, observerCtx, step, run, from, to, current.event, current.data,
-			)
+			); err != nil {
+				observerFailures = append(observerFailures, err)
+			}
 		}
 
 		var ok bool
@@ -412,14 +526,13 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 			break
 		}
 	}
+	if len(observerFailures) != 0 {
+		result.err = errors.Join(result.err, errors.Join(observerFailures...))
+	}
 	completed = true
 	return result
 }
 
 func (r *Runtime[S, E, T]) fireMachine(ctx context.Context, from S, event E, data T) (S, error) {
-	if r.machine != nil {
-		return r.machine.Fire(ctx, from, event, data)
-	}
-	var zero statemachine.Machine[S, E, T]
-	return zero.Fire(ctx, from, event, data)
+	return r.machine.Fire(ctx, from, event, data)
 }

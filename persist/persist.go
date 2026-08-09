@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync/atomic"
 
 	"github.com/open-ships/statemachine"
+	"github.com/open-ships/statemachine/internal/keycheck"
 )
 
 func isNilStore(store any) bool {
@@ -32,6 +34,16 @@ var (
 
 	// ErrNoStore reports a nil Store or an unconfigured FuncStore.
 	ErrNoStore = errors.New("persist: store not configured")
+
+	// ErrInvalidKey reports a Store key with an uncomparable dynamic value.
+	ErrInvalidKey = errors.New("persist: key is not strictly comparable")
+	// ErrStoreContract reports that a Store called its transition callback more
+	// than once or reported success without calling it.
+	ErrStoreContract = errors.New("persist: store violated the update contract")
+	// ErrStepRepeated reports a second callback invocation by one Store.Update.
+	ErrStepRepeated = errors.New("persist: store called the transition step more than once")
+	// ErrStepNotCalled reports Store.Update success without a callback invocation.
+	ErrStepNotCalled = errors.New("persist: store returned success without calling the transition step")
 )
 
 // Store owns one versioned update for an aggregate identified by K. X is the
@@ -39,6 +51,8 @@ var (
 //
 // After loading the state, Update must call step exactly once and commit the
 // state step returns only when step succeeds. It must not retry step.
+// Fire and Step detect repeated callbacks and successful returns without a
+// callback, report [ErrStoreContract], and never execute a repeated step.
 // Implementations that can race with another process must use a conditional
 // write and report an error matching [ErrConflict] when it loses. If step
 // panics, the Store must abort its unit of work and propagate the panic.
@@ -125,6 +139,10 @@ func apply[K, S, E comparable, T, X any](
 	data func(X) T,
 ) (S, StepResult[S, E], error) {
 	result := StepResult[S, E]{Event: event}
+	if !keycheck.Value(key) {
+		var zero S
+		return zero, result, ErrInvalidKey
+	}
 	if isNilStore(store) {
 		var zero S
 		return zero, result, ErrNoStore
@@ -132,7 +150,15 @@ func apply[K, S, E comparable, T, X any](
 	if machine == nil {
 		machine = new(statemachine.Machine[S, E, T])
 	}
+	var started atomic.Bool
+	var repeated atomic.Bool
+	firstDone := make(chan struct{})
 	state, err := store.Update(ctx, key, func(ctx context.Context, from S, unit X) (S, error) {
+		if !started.CompareAndSwap(false, true) {
+			repeated.Store(true)
+			return from, errors.Join(ErrStoreContract, ErrStepRepeated)
+		}
+		defer close(firstDone)
 		var value T
 		if data != nil {
 			value = data(unit)
@@ -145,7 +171,17 @@ func apply[K, S, E comparable, T, X any](
 		result.TransitionError = transitionErr
 		return to, transitionErr
 	})
-	if err == nil {
+	if started.Load() {
+		<-firstDone
+	}
+	if repeated.Load() {
+		result.Confirmed = false
+		return state, result, errors.Join(ErrStoreContract, ErrStepRepeated, err)
+	}
+	if !started.Load() && err == nil {
+		return state, result, errors.Join(ErrStoreContract, ErrStepNotCalled)
+	}
+	if err == nil && started.Load() {
 		result.Confirmed = true
 	}
 	return state, result, err

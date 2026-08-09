@@ -16,44 +16,59 @@ func TestConstructorAndLimitErrors(t *testing.T) {
 	if _, err := New(valid, Limits{}); !errors.Is(err, ErrInvalidLimits) {
 		t.Fatalf("New limits = %v", err)
 	}
-	if _, err := Restore[testState, testEvent, *testData](nil, Snapshot[testState]{}, limits()); !errors.Is(err, ErrNilMachine) {
+	if _, err := Restore[testState, testEvent, *testData](nil, Snapshot[testState, testEvent]{}, limits()); !errors.Is(err, ErrNilMachine) {
 		t.Fatalf("Restore nil = %v", err)
 	}
-	if _, err := Restore(valid, Snapshot[testState]{DefinitionID: valid.ID(), State: testIdle}, Limits{}); !errors.Is(err, ErrInvalidLimits) {
+	if _, err := Restore(valid, Snapshot[testState, testEvent]{DefinitionID: valid.ID(), State: testIdle}, Limits{}); !errors.Is(err, ErrInvalidLimits) {
 		t.Fatalf("Restore limits = %v", err)
 	}
-	if _, err := Restore(valid, Snapshot[testState]{DefinitionID: valid.ID(), State: testIdle, Revision: math.MaxUint64}, limits()); !errors.Is(err, ErrCounterExhausted) {
+	if _, err := Restore(valid, Snapshot[testState, testEvent]{DefinitionID: valid.ID(), ExecutionID: "execution", State: testIdle, Revision: math.MaxUint64}, limits()); !errors.Is(err, ErrCounterExhausted) {
 		t.Fatalf("Restore counter = %v", err)
+	}
+	invalidPending := Snapshot[testState, testEvent]{
+		DefinitionID: valid.ID(), ExecutionID: "execution", State: testIdle,
+		Attempt: 1, InDoubt: true,
+		Pending: &PendingSnapshot[testState, testEvent]{
+			Attempt: AttemptID{ExecutionID: "execution", Sequence: 1},
+			From:    testIdle, Event: testStop, TransitionID: "unknown", To: testRunning,
+		},
+	}
+	if _, err := Restore(valid, invalidPending, limits()); !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("Restore invalid pending = %v", err)
+	}
+	invalidPending.Pending = nil
+	if _, err := Restore(valid, invalidPending, limits()); !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("Restore missing pending = %v", err)
 	}
 }
 
 func TestStartFailureNilContextAndStatusErrors(t *testing.T) {
 	definition := validDefinition()
-	definition.Reconcile = []Reconciler[testState, *testData]{
-		func(context.Context, Snapshot[testState], *testData) error { return errReconcile },
+	definition.Reconcile = []Reconciler[testState, testEvent, *testData]{
+		func(context.Context, Snapshot[testState, testEvent], *testData) error { return errReconcile },
 	}
 	supervisor, _ := New(MustCompile(definition), limits())
-	//nolint:staticcheck // This test verifies the defensive nil-context result.
-	if result := supervisor.Start(nil, &testData{}); !errors.Is(result.Err, ErrNilContext) {
+	//lint:ignore SA1012 This test verifies the defensive nil-context result.
+	if result := supervisor.start(nil, &testData{}); !errors.Is(result.Err, ErrNilContext) {
 		t.Fatalf("nil Start = %+v", result)
 	}
-	failed := supervisor.Start(context.Background(), &testData{})
-	if !failed.Faulted || failed.Uncertain || !errors.Is(failed.Err, ErrViolation) || !errors.Is(failed.Err, errReconcile) {
+	failed := supervisor.start(context.Background(), &testData{})
+	if !failed.Faulted || !failed.Uncertain || !errors.Is(failed.Err, ErrViolation) || !errors.Is(failed.Err, errReconcile) {
 		t.Fatalf("failed Start = %+v", failed)
 	}
-	if again := supervisor.Start(context.Background(), &testData{}); !errors.Is(again.Err, errReconcile) {
+	if again := supervisor.start(context.Background(), &testData{}); !errors.Is(again.Err, errReconcile) {
 		t.Fatalf("faulted Start = %+v", again)
 	}
-	//nolint:staticcheck // This test verifies the defensive nil-context result.
-	if nilIssue := supervisor.Issue(nil, testStart, &testData{}); !nilIssue.Faulted || !errors.Is(nilIssue.Err, ErrNilContext) {
+	//lint:ignore SA1012 This test verifies the defensive nil-context result.
+	if nilIssue := supervisor.issue(nil, testStart, &testData{}); !nilIssue.Faulted || !errors.Is(nilIssue.Err, ErrNilContext) {
 		t.Fatalf("nil Issue = %+v", nilIssue)
 	}
-	//nolint:staticcheck // This test verifies the defensive nil-context result.
-	if nilVerify := supervisor.Verify(nil, 1, &testData{}); !nilVerify.Faulted || !errors.Is(nilVerify.Err, ErrNilContext) {
+	//lint:ignore SA1012 This test verifies the defensive nil-context result.
+	if nilVerify := supervisor.verify(nil, AttemptID{Sequence: 1}, &testData{}); !nilVerify.Faulted || !errors.Is(nilVerify.Err, ErrNilContext) {
 		t.Fatalf("nil Verify = %+v", nilVerify)
 	}
-	//nolint:staticcheck // This test verifies the defensive nil-context result.
-	if nilRecover := supervisor.Recover(nil, &testData{}); !nilRecover.Faulted || !errors.Is(nilRecover.Err, ErrNilContext) {
+	//lint:ignore SA1012 This test verifies the defensive nil-context result.
+	if nilRecover := supervisor.recover(nil, &testData{}); !nilRecover.Faulted || !errors.Is(nilRecover.Err, ErrNilContext) {
 		t.Fatalf("nil Recover = %+v", nilRecover)
 	}
 }
@@ -62,8 +77,8 @@ func TestStartOverlapAndAlreadyStarted(t *testing.T) {
 	block := make(chan struct{})
 	entered := make(chan struct{}, 1)
 	definition := validDefinition()
-	definition.Reconcile = []Reconciler[testState, *testData]{
-		func(context.Context, Snapshot[testState], *testData) error {
+	definition.Reconcile = []Reconciler[testState, testEvent, *testData]{
+		func(context.Context, Snapshot[testState, testEvent], *testData) error {
 			entered <- struct{}{}
 			<-block
 			return nil
@@ -71,19 +86,19 @@ func TestStartOverlapAndAlreadyStarted(t *testing.T) {
 	}
 	supervisor, _ := New(MustCompile(definition), limits())
 	resultCh := make(chan Result[testState, testEvent], 1)
-	go func() { resultCh <- supervisor.Start(context.Background(), &testData{}) }()
+	go func() { resultCh <- supervisor.start(context.Background(), &testData{}) }()
 	<-entered
-	if overlap := supervisor.Start(context.Background(), &testData{}); !errors.Is(overlap.Err, ErrBusy) {
+	if overlap := supervisor.start(context.Background(), &testData{}); !errors.Is(overlap.Err, ErrBusy) {
 		t.Fatalf("overlap Start = %+v", overlap)
 	}
 	close(block)
 	if result := <-resultCh; result.Err != nil {
 		t.Fatalf("Start = %+v", result)
 	}
-	if again := supervisor.Start(context.Background(), &testData{}); !errors.Is(again.Err, ErrAlreadyStarted) {
+	if again := supervisor.start(context.Background(), &testData{}); !errors.Is(again.Err, ErrAlreadyStarted) {
 		t.Fatalf("second Start = %+v", again)
 	}
-	if recovery := supervisor.Recover(context.Background(), &testData{}); !errors.Is(recovery.Err, ErrNotFaulted) {
+	if recovery := supervisor.recover(context.Background(), &testData{}); !errors.Is(recovery.Err, ErrNotFaulted) {
 		t.Fatalf("Recover while ready = %+v", recovery)
 	}
 }
@@ -99,8 +114,8 @@ func TestGlobalPreconditionFailsBeforeGuard(t *testing.T) {
 		return nil
 	}
 	supervisor, _ := New(MustCompile(definition), limits())
-	_ = supervisor.Start(context.Background(), &testData{})
-	result := supervisor.Issue(context.Background(), testStart, &testData{})
+	_ = supervisor.start(context.Background(), &testData{})
+	result := supervisor.issue(context.Background(), testStart, &testData{})
 	if !result.Faulted || result.Selected || guardCalls != 0 || !errors.Is(result.Err, errPrecondition) {
 		t.Fatalf("Issue = %+v, guard calls %d", result, guardCalls)
 	}
@@ -138,8 +153,8 @@ func TestInvariantAndPostconditionFailuresLatchAtTheirPhases(t *testing.T) {
 			definition := validDefinition()
 			test.configure(&definition)
 			supervisor, _ := New(MustCompile(definition), limits())
-			_ = supervisor.Start(context.Background(), &testData{})
-			result := supervisor.Issue(context.Background(), testStart, &testData{})
+			_ = supervisor.start(context.Background(), &testData{})
+			result := supervisor.issue(context.Background(), testStart, &testData{})
 			if !result.Faulted || result.Phase != test.phase || result.Uncertain || !errors.Is(result.Err, errPrecondition) {
 				t.Fatalf("Issue = %+v", result)
 			}
@@ -150,21 +165,21 @@ func TestInvariantAndPostconditionFailuresLatchAtTheirPhases(t *testing.T) {
 func TestIssueAndVerifyModeErrors(t *testing.T) {
 	machine := MustCompile(validDefinition())
 	stopped, _ := New(machine, limits())
-	if result := stopped.Verify(context.Background(), 1, &testData{}); !errors.Is(result.Err, ErrNotStarted) {
+	if result := stopped.verify(context.Background(), AttemptID{Sequence: 1}, &testData{}); !errors.Is(result.Err, ErrNotStarted) {
 		t.Fatalf("stopped Verify = %+v", result)
 	}
 
 	supervisor, _ := New(machine, limits())
-	_ = supervisor.Start(context.Background(), &testData{})
-	issued := supervisor.Issue(context.Background(), testStart, &testData{})
-	if result := supervisor.Issue(context.Background(), testStart, &testData{}); !errors.Is(result.Err, ErrAwaitingVerification) {
+	_ = supervisor.start(context.Background(), &testData{})
+	issued := supervisor.issue(context.Background(), testStart, &testData{})
+	if result := supervisor.issue(context.Background(), testStart, &testData{}); !errors.Is(result.Err, ErrAwaitingVerification) {
 		t.Fatalf("Issue while awaiting = %+v", result)
 	}
 	fault := supervisor.Trip(nil)
 	if !errors.Is(&fault, ErrTripped) || fault.Phase != PhaseVerify || !fault.Uncertain {
 		t.Fatalf("Trip nil = %+v", fault)
 	}
-	if result := supervisor.Verify(context.Background(), issued.Attempt, &testData{}); !errors.Is(result.Err, ErrTripped) {
+	if result := supervisor.verify(context.Background(), issued.AttemptKey, &testData{}); !errors.Is(result.Err, ErrTripped) {
 		t.Fatalf("faulted Verify = %+v", result)
 	}
 }
@@ -181,14 +196,14 @@ func TestIssueOverlapIsFailFast(t *testing.T) {
 		},
 	}
 	supervisor, _ := New(MustCompile(definition), limits())
-	_ = supervisor.Start(context.Background(), &testData{})
+	_ = supervisor.start(context.Background(), &testData{})
 	resultCh := make(chan Result[testState, testEvent], 1)
-	go func() { resultCh <- supervisor.Issue(context.Background(), testStart, &testData{}) }()
+	go func() { resultCh <- supervisor.issue(context.Background(), testStart, &testData{}) }()
 	<-entered
-	if overlap := supervisor.Issue(context.Background(), testStart, &testData{}); !errors.Is(overlap.Err, ErrBusy) {
+	if overlap := supervisor.issue(context.Background(), testStart, &testData{}); !errors.Is(overlap.Err, ErrBusy) {
 		t.Fatalf("overlap Issue = %+v", overlap)
 	}
-	if verify := supervisor.Verify(context.Background(), 1, &testData{}); !errors.Is(verify.Err, ErrBusy) {
+	if verify := supervisor.verify(context.Background(), AttemptID{Sequence: 1}, &testData{}); !errors.Is(verify.Err, ErrBusy) {
 		t.Fatalf("Verify during Issue = %+v", verify)
 	}
 	close(block)
@@ -202,20 +217,20 @@ func TestIssueOverlapIsFailFast(t *testing.T) {
 func TestCancelledOperationLatchesAndCounterExhaustionFaults(t *testing.T) {
 	machine := MustCompile(validDefinition())
 	supervisor, _ := New(machine, limits())
-	_ = supervisor.Start(context.Background(), &testData{})
+	_ = supervisor.start(context.Background(), &testData{})
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	result := supervisor.Issue(cancelled, testStart, &testData{})
+	result := supervisor.issue(cancelled, testStart, &testData{})
 	if !result.Faulted || !errors.Is(result.Err, context.Canceled) {
 		t.Fatalf("cancelled Issue = %+v", result)
 	}
 
 	supervisor, _ = New(machine, limits())
-	_ = supervisor.Start(context.Background(), &testData{})
+	_ = supervisor.start(context.Background(), &testData{})
 	supervisor.mu.Lock()
 	supervisor.attempt = math.MaxUint64
 	supervisor.mu.Unlock()
-	result = supervisor.Issue(context.Background(), testStart, &testData{})
+	result = supervisor.issue(context.Background(), testStart, &testData{})
 	if !result.Faulted || !errors.Is(result.Err, ErrCounterExhausted) {
 		t.Fatalf("exhausted Issue = %+v", result)
 	}
@@ -255,8 +270,8 @@ func TestTripInsideIssueAndPostconditionPreventsCommit(t *testing.T) {
 			var supervisor *Supervisor[testState, testEvent, *testData]
 			test.configure(&definition, &supervisor)
 			supervisor, _ = New(MustCompile(definition), limits())
-			_ = supervisor.Start(context.Background(), &testData{})
-			result := supervisor.Issue(context.Background(), testStart, &testData{})
+			_ = supervisor.start(context.Background(), &testData{})
+			result := supervisor.issue(context.Background(), testStart, &testData{})
 			if !result.Faulted || result.Committed || !errors.Is(result.Err, errTrip) {
 				t.Fatalf("Issue = %+v", result)
 			}
@@ -267,16 +282,16 @@ func TestTripInsideIssueAndPostconditionPreventsCommit(t *testing.T) {
 func TestCommitCounterDefenceAndExpiredTimerNoop(t *testing.T) {
 	machine := MustCompile(validDefinition())
 	supervisor, _ := New(machine, limits())
-	_ = supervisor.Start(context.Background(), &testData{})
-	issued := supervisor.Issue(context.Background(), testStart, &testData{})
+	_ = supervisor.start(context.Background(), &testData{})
+	issued := supervisor.issue(context.Background(), testStart, &testData{})
 	supervisor.mu.Lock()
 	supervisor.revision = math.MaxUint64
 	supervisor.mu.Unlock()
-	result := supervisor.Verify(context.Background(), issued.Attempt, &testData{})
+	result := supervisor.verify(context.Background(), issued.AttemptKey, &testData{})
 	if !result.Faulted || result.Committed || !errors.Is(result.Err, ErrCounterExhausted) {
 		t.Fatalf("Verify = %+v", result)
 	}
-	supervisor.verificationExpired(issued.Attempt)
+	supervisor.verificationExpired(issued.Attempt, 0)
 
 	defensive := supervisor.faultResult(Result[testState, testEvent]{}, nil)
 	if !defensive.Faulted || !errors.Is(defensive.Err, ErrFaulted) {
@@ -304,6 +319,14 @@ func TestStringersAndErrorTypes(t *testing.T) {
 	}
 	if got := Mode(255).String(); got != "Mode(255)" {
 		t.Fatalf("unknown Mode = %q", got)
+	}
+	for _, kind := range []RecordKind{
+		RecordStart, RecordIssue, RecordVerify, RecordTrip, RecordRecover,
+		RecordVerificationExpired, RecordSecondaryCause, RecordKind(255),
+	} {
+		if kind.String() == "" {
+			t.Fatalf("empty RecordKind string for %d", kind)
+		}
 	}
 
 	var nilFault *Fault[testState, testEvent]
