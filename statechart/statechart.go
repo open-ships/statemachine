@@ -8,17 +8,16 @@
 //
 // External transitions run exit actions from the active state toward, but not
 // including, the least common ancestor of Source and Target. The transition
-// effect then runs, the final initial-resolved Destination is committed, and
-// entry actions run from that ancestor toward the destination. Internal
-// transitions run only their effect. Reentry transitions exit from the active
+// effect then runs, entry actions run from that ancestor toward the destination,
+// and the final initial-resolved Destination commits only after they succeed.
+// Internal transitions run only their effect. Reentry transitions exit from the active
 // state through the state that handled the event, then re-enter that state and
 // descend through its initial states. A composite state without an Initial may
 // itself be active.
 //
-// Exit and transition-effect failures leave the old state committed. Entry
-// actions begin only after the destination is committed, so an entry failure
-// leaves the new state committed. [ActionError] exposes both the phase and that
-// commit status. Actions completed before an error or panic are not rolled
+// Exit, transition-effect, and entry failures leave the old state committed.
+// [ActionError] exposes the phase, failing node/action, and completed action
+// count. Actions completed before an error or panic are not rolled
 // back. An Instance rejects overlapping and same-instance recursive Fire calls
 // with [ErrInFlight].
 //
@@ -26,8 +25,7 @@
 // hierarchy, statically possible inherited transitions, and a pure projection
 // of one active state. [Instance.Position] snapshots the owned state. An
 // Instance created by [Chart.NewWithObservers] emits committed exits and entries
-// after entry processing terminates, including when an entry error, panic, or
-// runtime.Goexit occurs after commit.
+// only after entry processing succeeds.
 package statechart
 
 import (
@@ -39,6 +37,7 @@ import (
 	"sync"
 
 	"github.com/open-ships/statemachine"
+	"github.com/open-ships/statemachine/internal/keycheck"
 )
 
 // ErrNotPermitted is [statemachine.ErrNotPermitted].
@@ -175,6 +174,12 @@ type Chart[S, E comparable, T any] struct {
 // row with the same From and Event. It reports all independently discoverable
 // defects together with [errors.Join].
 func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Chart[S, E, T], error) {
+	if !keycheck.StrictType[S]() {
+		return nil, errors.New("statechart: state type must not contain an interface")
+	}
+	if !keycheck.StrictType[E]() {
+		return nil, errors.New("statechart: event type must not contain an interface")
+	}
 	c := &Chart[S, E, T]{
 		states:  make(map[S]stateActions[S, E, T], len(definition.States)),
 		order:   make([]S, 0, len(definition.States)),
@@ -383,7 +388,7 @@ func (c *Chart[S, E, T]) newInstance(
 		return nil, fmt.Errorf("statechart: initial state %v is undeclared", initial)
 	}
 	return &Instance[S, E, T]{
-		chart: c, state: c.destination(initial), observers: copyObservers(observers),
+		chart: *c, state: c.destination(initial), observers: copyObservers(observers),
 	}, nil
 }
 
@@ -534,12 +539,20 @@ func (p Phase) String() string {
 	}
 }
 
-// ActionError reports a lifecycle action failure. Committed says whether the
-// Instance had published Destination before the action failed. Exit and effect
-// errors are uncommitted; entry errors are committed.
+// ActionError reports a lifecycle action failure. Destination publication
+// occurs after entry succeeds, so current failures are uncommitted. Committed
+// remains for forward-compatible reporting of any future post-commit action.
 type ActionError struct {
 	Phase     Phase
 	Committed bool
+	// State identifies the node whose lifecycle action failed. It is nil for a
+	// transition effect.
+	State any
+	// ActionIndex is the zero-based index within State's entry or exit actions.
+	ActionIndex int
+	// Completed is the number of lifecycle actions in this phase that returned
+	// successfully before the failure.
+	Completed int
 	Err       error
 }
 
@@ -566,7 +579,7 @@ func (e *ActionError) Unwrap() error {
 // it starts in the zero state with an empty Chart and refuses every event. An
 // Instance must not be copied after first use.
 type Instance[S, E comparable, T any] struct {
-	chart     *Chart[S, E, T]
+	chart     Chart[S, E, T]
 	mu        sync.RWMutex
 	state     S
 	inFlight  bool
@@ -574,8 +587,8 @@ type Instance[S, E comparable, T any] struct {
 	seq       uint64
 }
 
-// State returns the committed active state. During exits and the transition
-// effect it returns Source; during entries it returns Destination.
+// State returns the committed active state. During exits, the transition
+// effect, and entries it returns Source.
 func (i *Instance[S, E, T]) State() S {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -590,11 +603,10 @@ func (i *Instance[S, E, T]) State() S {
 // unchanged.
 //
 // For External and Reentry transitions, exit actions run child-to-parent, then
-// Do runs, then Destination is committed, then entry actions run
-// parent-to-child. Actions on one state run in their declaration order. An exit
-// or Do error returns an [ActionError] with Committed false and leaves Source
-// active. An entry error returns one with Committed true and leaves Destination
-// active. Internal runs only Do and never changes the active state.
+// Do and entry actions run, then Destination is committed. Actions on one state
+// run in declaration order. Any lifecycle error returns an [ActionError] with
+// Committed false and leaves Source active. Internal runs only Do and never
+// changes the active state.
 //
 // A panic propagates after the in-flight marker is cleared. State remains at
 // whichever side of the commit point the panic occurred; effects and lifecycle
@@ -604,8 +616,8 @@ func (i *Instance[S, E, T]) State() S {
 // Fire does not interpret ctx cancellation itself; it passes ctx to Guards and
 // Actions, which decide whether cancellation should decline or fail the event.
 // Attached observers receive a committed exit/entry batch after entry actions
-// terminate. Observer failures are isolated and cannot replace this method's
-// error or panic.
+// succeed. Observer panic and runtime.Goexit failures retain their stacks and
+// are returned as errors matching statemachine.ErrObserverFailed after commit.
 func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
 	i.mu.Lock()
 	if i.inFlight {
@@ -643,15 +655,33 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
 	} else {
 		exits, entries = i.chart.externalPaths(source, transition.To, destination)
 	}
+	completedExits := 0
 	for _, state := range exits {
-		for _, action := range i.chart.states[state].exit {
+		for index, action := range i.chart.states[state].exit {
 			if err := runAction(ctx, action, info, data); err != nil {
-				return &ActionError{Phase: PhaseExit, Err: err}
+				return &ActionError{
+					Phase: PhaseExit, State: state, ActionIndex: index,
+					Completed: completedExits, Err: err,
+				}
 			}
+			completedExits++
 		}
 	}
 	if err := runAction(ctx, transition.Do, info, data); err != nil {
 		return &ActionError{Phase: PhaseEffect, Err: err}
+	}
+
+	completedEntries := 0
+	for _, state := range entries {
+		for index, action := range i.chart.states[state].entry {
+			if err := runAction(ctx, action, info, data); err != nil {
+				return &ActionError{
+					Phase: PhaseEntry, State: state, ActionIndex: index,
+					Completed: completedEntries, Err: err,
+				}
+			}
+			completedEntries++
+		}
 	}
 
 	var step uint64
@@ -666,14 +696,7 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
 	}
 	i.mu.Unlock()
 	if len(observers) != 0 {
-		defer deliverTransitionObservations(observers, ctx, step, exits, entries, event, info, data)
-	}
-	for _, state := range entries {
-		for _, action := range i.chart.states[state].entry {
-			if err := runAction(ctx, action, info, data); err != nil {
-				return &ActionError{Phase: PhaseEntry, Committed: true, Err: err}
-			}
-		}
+		return deliverTransitionObservations(observers, ctx, step, exits, entries, event, info, data)
 	}
 	return nil
 }
@@ -701,14 +724,14 @@ type permit[S, E comparable] struct {
 // as Fire.
 //
 // Consequently, a concurrent Fire does not block Permitted: the snapshot sees
-// Source during exit and Do, or Destination during entry. The caller must
+// Source until every entry succeeds. The caller must
 // synchronize mutable data in T against actions, and Guards must be pure.
 func (i *Instance[S, E, T]) Permitted(ctx context.Context, data T) iter.Seq2[E, S] {
 	i.mu.RLock()
 	source := i.state
 	chart := i.chart
 	i.mu.RUnlock()
-	if chart == nil {
+	if chart.shape == nil {
 		return func(func(E, S) bool) {}
 	}
 

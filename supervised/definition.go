@@ -5,19 +5,34 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"reflect"
 	"strings"
+	"time"
+
+	"github.com/open-ships/statemachine/internal/keycheck"
 )
 
 // Attempt identifies one event accepted by a Supervisor. Attempt is assigned
 // before preconditions run, so refusals and faults retain the same identifier
-// the caller received.
+// the caller received. StartedAt uses the Supervisor Clock.
 type Attempt[S, E comparable] struct {
 	DefinitionID string
+	ExecutionID  string
 	ID           uint64
 	Revision     uint64
+	StartedAt    time.Time
 	From         S
 	Event        E
+}
+
+// AttemptID is a non-reusable execution-scoped Verification identifier.
+type AttemptID struct {
+	ExecutionID string
+	Sequence    uint64
+}
+
+// Identifier returns the durable identity callers must present to Verify.
+func (a Attempt[S, E]) Identifier() AttemptID {
+	return AttemptID{ExecutionID: a.ExecutionID, Sequence: a.ID}
 }
 
 // Change identifies the transition selected for an Attempt.
@@ -48,7 +63,7 @@ type Action[S, E comparable, T any] func(context.Context, Change[S, E], T) error
 // Reconciler verifies that a restored or faulted Supervisor's committed state
 // agrees with application-owned physical and durable state. It must not issue
 // motion. Every Reconciler must pass before Start or Recover succeeds.
-type Reconciler[S comparable, T any] func(context.Context, Snapshot[S], T) error
+type Reconciler[S, E comparable, T any] func(context.Context, Snapshot[S, E], T) error
 
 // State declares one state in a strict Definition. A terminal State implicitly
 // refuses every declared event. A non-terminal State must either have at least
@@ -92,7 +107,7 @@ type Definition[S, E comparable, T any] struct {
 	Preconditions  []Precondition[S, E, T]
 	Invariants     []Check[S, E, T]
 	Postconditions []Check[S, E, T]
-	Reconcile      []Reconciler[S, T]
+	Reconcile      []Reconciler[S, E, T]
 }
 
 type transitionKey[S, E comparable] struct {
@@ -126,7 +141,7 @@ type Machine[S, E comparable, T any] struct {
 	preconditions  []Precondition[S, E, T]
 	invariants     []Check[S, E, T]
 	postconditions []Check[S, E, T]
-	reconcile      []Reconciler[S, T]
+	reconcile      []Reconciler[S, E, T]
 }
 
 // StateInfo is one immutable state declaration exposed for inspection.
@@ -151,14 +166,20 @@ type TransitionInfo[S, E comparable] struct {
 // independently discoverable defects together with errors.Join.
 func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Machine[S, E, T], error) {
 	var problems []error
+	unsafeKeyType := false
 	if strings.TrimSpace(definition.ID) == "" {
 		problems = append(problems, errors.New("supervised: definition ID is empty"))
 	}
-	if reflect.TypeFor[S]().Kind() == reflect.Interface {
-		problems = append(problems, errors.New("supervised: state type must not be an interface"))
+	if !keycheck.StrictType[S]() {
+		problems = append(problems, errors.New("supervised: state type must not be an interface or contain one"))
+		unsafeKeyType = true
 	}
-	if reflect.TypeFor[E]().Kind() == reflect.Interface {
-		problems = append(problems, errors.New("supervised: event type must not be an interface"))
+	if !keycheck.StrictType[E]() {
+		problems = append(problems, errors.New("supervised: event type must not be an interface or contain one"))
+		unsafeKeyType = true
+	}
+	if unsafeKeyType {
+		return nil, errors.Join(problems...)
 	}
 	if len(definition.States) == 0 {
 		problems = append(problems, errors.New("supervised: definition has no states"))
@@ -375,7 +396,7 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Machine[S
 		preconditions:  append([]Precondition[S, E, T](nil), definition.Preconditions...),
 		invariants:     append([]Check[S, E, T](nil), definition.Invariants...),
 		postconditions: append([]Check[S, E, T](nil), definition.Postconditions...),
-		reconcile:      append([]Reconciler[S, T](nil), definition.Reconcile...),
+		reconcile:      append([]Reconciler[S, E, T](nil), definition.Reconcile...),
 	}, nil
 }
 

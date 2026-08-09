@@ -24,6 +24,17 @@ type testData struct {
 	verified bool
 }
 
+func TestCompileRejectsNestedInterfaceKeyBeforeMapUse(t *testing.T) {
+	type nested struct{ Value any }
+	_, err := Compile(Definition[nested, testEvent, struct{}]{
+		ID: "nested", States: []State[nested, testEvent]{{Name: nested{Value: []int{1}}}},
+		Events: []testEvent{testStart},
+	})
+	if err == nil || !strings.Contains(err.Error(), "state type must not be an interface") {
+		t.Fatalf("Compile = %v", err)
+	}
+}
+
 func passPrecondition(context.Context, Attempt[testState, testEvent], *testData) error {
 	return nil
 }
@@ -32,7 +43,7 @@ func passCheck(context.Context, Change[testState, testEvent], *testData) error {
 	return nil
 }
 
-func passReconcile(context.Context, Snapshot[testState], *testData) error {
+func passReconcile(context.Context, Snapshot[testState, testEvent], *testData) error {
 	return nil
 }
 
@@ -58,7 +69,7 @@ func validDefinition() Definition[testState, testEvent, *testData] {
 		Preconditions:  []Precondition[testState, testEvent, *testData]{passPrecondition},
 		Invariants:     []Check[testState, testEvent, *testData]{passCheck},
 		Postconditions: []Check[testState, testEvent, *testData]{passCheck},
-		Reconcile:      []Reconciler[testState, *testData]{passReconcile},
+		Reconcile:      []Reconciler[testState, testEvent, *testData]{passReconcile},
 	}
 }
 
@@ -140,7 +151,7 @@ func TestCompileReportsStrictDefinitionProblems(t *testing.T) {
 	noops.Preconditions = nil
 	noops.Invariants = []Check[testState, testEvent, *testData]{nil}
 	noops.Postconditions = nil
-	noops.Reconcile = []Reconciler[testState, *testData]{nil}
+	noops.Reconcile = []Reconciler[testState, testEvent, *testData]{nil}
 	noops.Transitions = append(noops.Transitions,
 		Transition[testState, testEvent, *testData]{
 			ID: "start-running", From: testRunning, Event: testStart, To: testIdle,
@@ -219,7 +230,7 @@ func TestCompileRejectsInterfaceStateAndEventTypes(t *testing.T) {
 		Preconditions:  []Precondition[any, any, struct{}]{func(context.Context, Attempt[any, any], struct{}) error { return nil }},
 		Invariants:     []Check[any, any, struct{}]{func(context.Context, Change[any, any], struct{}) error { return nil }},
 		Postconditions: []Check[any, any, struct{}]{func(context.Context, Change[any, any], struct{}) error { return nil }},
-		Reconcile:      []Reconciler[any, struct{}]{func(context.Context, Snapshot[any], struct{}) error { return nil }},
+		Reconcile:      []Reconciler[any, any, struct{}]{func(context.Context, Snapshot[any, any], struct{}) error { return nil }},
 	}
 	_, err := Compile(definition)
 	if err == nil || !strings.Contains(err.Error(), "state type must not be an interface") || !strings.Contains(err.Error(), "event type must not be an interface") {

@@ -41,8 +41,8 @@ func tracedDefinition() Definition[testState, testEvent, *testData] {
 			return nil
 		},
 	}
-	definition.Reconcile = []Reconciler[testState, *testData]{
-		func(_ context.Context, _ Snapshot[testState], data *testData) error {
+	definition.Reconcile = []Reconciler[testState, testEvent, *testData]{
+		func(_ context.Context, _ Snapshot[testState, testEvent], data *testData) error {
 			data.trace = append(data.trace, "reconcile")
 			return nil
 		},
@@ -79,17 +79,21 @@ func TestIssueVerifyCommitAndSnapshot(t *testing.T) {
 	}
 	data := &testData{}
 
-	if result := supervisor.Issue(context.Background(), testStart, data); !errors.Is(result.Err, ErrNotStarted) {
+	if result := supervisor.issue(context.Background(), testStart, data); !errors.Is(result.Err, ErrNotStarted) {
 		t.Fatalf("Issue before Start = %+v", result)
 	}
-	if result := supervisor.Start(context.Background(), data); result.Err != nil || result.Phase != PhaseStart {
+	if result := supervisor.start(context.Background(), data); result.Err != nil || result.Phase != PhaseStart {
 		t.Fatalf("Start = %+v", result)
 	}
-	issued := supervisor.Issue(context.Background(), testStart, data)
+	issued := supervisor.issue(context.Background(), testStart, data)
 	if issued.Err != nil || !issued.Selected || !issued.IssueCompleted || issued.Verified || issued.Committed || issued.Attempt != 1 {
 		t.Fatalf("Issue = %+v", issued)
 	}
-	if snapshot := supervisor.Snapshot(); snapshot.State != testIdle || snapshot.Revision != 0 {
+	if snapshot := supervisor.Snapshot(); snapshot.State != testIdle || snapshot.Revision != 0 ||
+		snapshot.Pending == nil || snapshot.Pending.Attempt != issued.AttemptKey ||
+		snapshot.Pending.From != testIdle || snapshot.Pending.Event != testStart ||
+		snapshot.Pending.TransitionID != "start-running" || snapshot.Pending.To != testRunning ||
+		snapshot.Pending.IssuedAt.IsZero() || snapshot.Pending.VerificationDeadline.IsZero() {
 		t.Fatalf("Snapshot after Issue = %+v", snapshot)
 	}
 	status := supervisor.Status()
@@ -97,16 +101,17 @@ func TestIssueVerifyCommitAndSnapshot(t *testing.T) {
 		t.Fatalf("Status after Issue = %+v", status)
 	}
 
-	stale := supervisor.Verify(context.Background(), issued.Attempt+1, &testData{verified: true})
+	stale := supervisor.verify(context.Background(), AttemptID{ExecutionID: issued.ExecutionID, Sequence: issued.Attempt + 1}, &testData{verified: true})
 	if !errors.Is(stale.Err, ErrStaleAttempt) || supervisor.Status().Mode != ModeAwaitingVerification {
 		t.Fatalf("stale Verify = %+v, status %+v", stale, supervisor.Status())
 	}
 	verifiedData := &testData{trace: data.trace, verified: true}
-	committed := supervisor.Verify(context.Background(), issued.Attempt, verifiedData)
+	committed := supervisor.verify(context.Background(), issued.AttemptKey, verifiedData)
 	if committed.Err != nil || !committed.IssueCompleted || !committed.Verified || !committed.Committed || committed.Revision != 1 {
 		t.Fatalf("Verify = %+v", committed)
 	}
-	if snapshot := supervisor.Snapshot(); snapshot != (Snapshot[testState]{DefinitionID: "test-machine/v1", State: testRunning, Revision: 1}) {
+	if snapshot := supervisor.Snapshot(); snapshot.DefinitionID != "test-machine/v1" || snapshot.ExecutionID == "" ||
+		snapshot.State != testRunning || snapshot.Revision != 1 || snapshot.Attempt != 1 || snapshot.InDoubt || snapshot.Faulted || snapshot.RecordedAt.IsZero() {
 		t.Fatalf("Snapshot after Verify = %+v", snapshot)
 	}
 	wantTrace := []string{
@@ -116,10 +121,10 @@ func TestIssueVerifyCommitAndSnapshot(t *testing.T) {
 	if strings.Join(verifiedData.trace, ",") != strings.Join(wantTrace, ",") {
 		t.Fatalf("trace = %v, want %v", verifiedData.trace, wantTrace)
 	}
-	if result := supervisor.Verify(context.Background(), issued.Attempt, verifiedData); !errors.Is(result.Err, ErrNoPending) {
+	if result := supervisor.verify(context.Background(), issued.AttemptKey, verifiedData); !errors.Is(result.Err, ErrNoPending) {
 		t.Fatalf("second Verify = %+v", result)
 	}
-	if result := supervisor.Issue(context.Background(), testStart, verifiedData); !errors.Is(result.Err, ErrNotPermitted) || result.Faulted {
+	if result := supervisor.issue(context.Background(), testStart, verifiedData); !errors.Is(result.Err, ErrNotPermitted) || result.Faulted {
 		t.Fatalf("terminal Issue = %+v", result)
 	}
 }
@@ -131,10 +136,10 @@ func TestPureLogicalTransitionCommitsDuringIssue(t *testing.T) {
 	machine := MustCompile(definition)
 	supervisor, _ := New(machine, limits())
 	data := &testData{}
-	if result := supervisor.Start(context.Background(), data); result.Err != nil {
+	if result := supervisor.start(context.Background(), data); result.Err != nil {
 		t.Fatal(result.Err)
 	}
-	result := supervisor.Issue(context.Background(), testStart, data)
+	result := supervisor.issue(context.Background(), testStart, data)
 	if result.Err != nil || !result.Selected || result.IssueCompleted || result.Verified || !result.Committed || result.Revision != 1 {
 		t.Fatalf("Issue = %+v", result)
 	}
@@ -163,10 +168,10 @@ func TestPreconditionsCannotFallThroughAndGuardRefusalDoesNotFault(t *testing.T)
 	}
 	machine := MustCompile(definition)
 	supervisor, _ := New(machine, limits())
-	if result := supervisor.Start(context.Background(), &testData{}); result.Err != nil {
+	if result := supervisor.start(context.Background(), &testData{}); result.Err != nil {
 		t.Fatal(result.Err)
 	}
-	result := supervisor.Issue(context.Background(), testStart, &testData{})
+	result := supervisor.issue(context.Background(), testStart, &testData{})
 	if !result.Selected || result.TransitionID != "fallback" || !result.Faulted || !errors.Is(result.Err, errPrecondition) || !errors.Is(result.Err, ErrViolation) {
 		t.Fatalf("Issue = %+v", result)
 	}
@@ -175,10 +180,21 @@ func TestPreconditionsCannotFallThroughAndGuardRefusalDoesNotFault(t *testing.T)
 	guardOnly.Transitions[0].Guard = func(context.Context, Change[testState, testEvent], *testData) error { return errVerify }
 	machine = MustCompile(guardOnly)
 	supervisor, _ = New(machine, limits())
-	_ = supervisor.Start(context.Background(), &testData{})
-	result = supervisor.Issue(context.Background(), testStart, &testData{})
-	if !errors.Is(result.Err, ErrNotPermitted) || !errors.Is(result.Err, errVerify) || result.Faulted || supervisor.Status().Mode != ModeReady {
+	_ = supervisor.start(context.Background(), &testData{})
+	result = supervisor.issue(context.Background(), testStart, &testData{})
+	if !errors.Is(result.Err, ErrNotPermitted) || !errors.Is(result.Err, errVerify) ||
+		!strings.Contains(result.Err.Error(), errVerify.Error()) || result.Faulted || supervisor.Status().Mode != ModeReady {
 		t.Fatalf("guard refusal = %+v, status %+v", result, supervisor.Status())
+	}
+}
+
+func TestIssueDistinguishesUndeclaredEvent(t *testing.T) {
+	supervisor, _ := New(MustCompile(validDefinition()), limits())
+	_ = supervisor.start(context.Background(), &testData{})
+	result := supervisor.issue(context.Background(), testStop, &testData{})
+	if !errors.Is(result.Err, ErrUnknownEvent) || errors.Is(result.Err, ErrNotPermitted) || result.Attempt != 0 ||
+		result.Selected || result.Faulted || supervisor.Status().Mode != ModeReady {
+		t.Fatalf("undeclared Issue = %+v, status %+v", result, supervisor.Status())
 	}
 }
 
@@ -187,8 +203,8 @@ func TestIssueFailureLatchesUntilSuccessfulRecovery(t *testing.T) {
 	definition.Transitions[0].Issue = func(context.Context, Change[testState, testEvent], *testData) error {
 		return errIssue
 	}
-	definition.Reconcile = []Reconciler[testState, *testData]{
-		func(_ context.Context, _ Snapshot[testState], data *testData) error {
+	definition.Reconcile = []Reconciler[testState, testEvent, *testData]{
+		func(_ context.Context, _ Snapshot[testState, testEvent], data *testData) error {
 			if !data.allow {
 				return errReconcile
 			}
@@ -197,23 +213,23 @@ func TestIssueFailureLatchesUntilSuccessfulRecovery(t *testing.T) {
 	}
 	machine := MustCompile(definition)
 	supervisor, _ := New(machine, limits())
-	if result := supervisor.Start(context.Background(), &testData{allow: true}); result.Err != nil {
+	if result := supervisor.start(context.Background(), &testData{allow: true}); result.Err != nil {
 		t.Fatal(result.Err)
 	}
-	failed := supervisor.Issue(context.Background(), testStart, &testData{})
+	failed := supervisor.issue(context.Background(), testStart, &testData{})
 	if !failed.Faulted || !failed.Uncertain || failed.Committed || !errors.Is(failed.Err, ErrFaulted) || !errors.Is(failed.Err, errIssue) {
 		t.Fatalf("failed Issue = %+v", failed)
 	}
 	if snapshot := supervisor.Snapshot(); snapshot.State != testIdle || snapshot.Revision != 0 {
 		t.Fatalf("Snapshot = %+v", snapshot)
 	}
-	if again := supervisor.Issue(context.Background(), testStart, &testData{}); !errors.Is(again.Err, errIssue) {
+	if again := supervisor.issue(context.Background(), testStart, &testData{}); !errors.Is(again.Err, errIssue) {
 		t.Fatalf("Issue while faulted = %+v", again)
 	}
-	if recovery := supervisor.Recover(context.Background(), &testData{}); !recovery.Faulted || !errors.Is(recovery.Err, errReconcile) {
+	if recovery := supervisor.recover(context.Background(), &testData{}); !recovery.Faulted || !errors.Is(recovery.Err, errReconcile) {
 		t.Fatalf("failed Recover = %+v", recovery)
 	}
-	if recovery := supervisor.Recover(context.Background(), &testData{allow: true}); recovery.Err != nil || recovery.Faulted {
+	if recovery := supervisor.recover(context.Background(), &testData{allow: true}); recovery.Err != nil || recovery.Faulted {
 		t.Fatalf("Recover = %+v", recovery)
 	}
 	if supervisor.Status().Mode != ModeReady {
@@ -225,9 +241,9 @@ func TestVerifyFailureIsUncertainAndDoesNotCommit(t *testing.T) {
 	machine := MustCompile(tracedDefinition())
 	supervisor, _ := New(machine, limits())
 	data := &testData{}
-	_ = supervisor.Start(context.Background(), data)
-	issued := supervisor.Issue(context.Background(), testStart, data)
-	result := supervisor.Verify(context.Background(), issued.Attempt, &testData{})
+	_ = supervisor.start(context.Background(), data)
+	issued := supervisor.issue(context.Background(), testStart, data)
+	result := supervisor.verify(context.Background(), issued.AttemptKey, &testData{})
 	if !result.IssueCompleted || result.Verified || result.Committed || !result.Faulted || !result.Uncertain || !errors.Is(result.Err, errVerify) {
 		t.Fatalf("Verify = %+v", result)
 	}
@@ -268,8 +284,8 @@ func TestCallbackPanicAndGoexitAreContained(t *testing.T) {
 			definition := validDefinition()
 			test.configure(&definition)
 			supervisor, _ := New(MustCompile(definition), limits())
-			_ = supervisor.Start(context.Background(), &testData{})
-			result := supervisor.Issue(context.Background(), testStart, &testData{})
+			_ = supervisor.start(context.Background(), &testData{})
+			result := supervisor.issue(context.Background(), testStart, &testData{})
 			if !result.Faulted || result.Uncertain != test.uncertain {
 				t.Fatalf("Issue = %+v", result)
 			}
@@ -278,7 +294,7 @@ func TestCallbackPanicAndGoexitAreContained(t *testing.T) {
 			}
 			if test.want == nil {
 				var panicErr *PanicError
-				if !errors.As(result.Err, &panicErr) || panicErr.Value != "motor panic" {
+				if !errors.As(result.Err, &panicErr) || panicErr.Value != "motor panic" || panicErr.Stack == "" {
 					t.Fatalf("Issue error = %v", result.Err)
 				}
 			}
@@ -300,9 +316,9 @@ func TestOperationTimeoutLeavesLateCallbackUncommittedAndBlocksRecovery(t *testi
 		OperationTimeout:    20 * time.Millisecond,
 		VerificationTimeout: time.Second,
 	})
-	_ = supervisor.Start(context.Background(), &testData{})
+	_ = supervisor.start(context.Background(), &testData{})
 	started := time.Now()
-	result := supervisor.Issue(context.Background(), testStart, &testData{})
+	result := supervisor.issue(context.Background(), testStart, &testData{})
 	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("Issue returned after %v", elapsed)
 	}
@@ -317,12 +333,12 @@ func TestOperationTimeoutLeavesLateCallbackUncommittedAndBlocksRecovery(t *testi
 	if status := supervisor.Status(); !status.CallbackRunning {
 		t.Fatalf("Status = %+v", status)
 	}
-	if recovery := supervisor.Recover(context.Background(), &testData{}); !errors.Is(recovery.Err, ErrCallbackRunning) {
+	if recovery := supervisor.recover(context.Background(), &testData{}); !errors.Is(recovery.Err, ErrCallbackRunning) {
 		t.Fatalf("Recover = %+v", recovery)
 	}
 	close(block)
 	eventually(t, time.Second, func() bool { return !supervisor.Status().CallbackRunning })
-	if recovery := supervisor.Recover(context.Background(), &testData{}); recovery.Err != nil {
+	if recovery := supervisor.recover(context.Background(), &testData{}); recovery.Err != nil {
 		t.Fatalf("Recover after callback return = %+v", recovery)
 	}
 	if snapshot := supervisor.Snapshot(); snapshot.State != testIdle || snapshot.Revision != 0 {
@@ -336,8 +352,8 @@ func TestVerificationTimeoutLatchesFault(t *testing.T) {
 		OperationTimeout:    time.Second,
 		VerificationTimeout: 20 * time.Millisecond,
 	})
-	_ = supervisor.Start(context.Background(), &testData{})
-	issued := supervisor.Issue(context.Background(), testStart, &testData{})
+	_ = supervisor.start(context.Background(), &testData{})
+	issued := supervisor.issue(context.Background(), testStart, &testData{})
 	if issued.Err != nil || !issued.IssueCompleted {
 		t.Fatalf("Issue = %+v", issued)
 	}
@@ -361,11 +377,11 @@ func TestTripRacingVerifyPreventsCommitAndIsFirstCause(t *testing.T) {
 		return nil
 	}
 	supervisor, _ := New(MustCompile(definition), limits())
-	_ = supervisor.Start(context.Background(), &testData{})
-	issued := supervisor.Issue(context.Background(), testStart, &testData{})
+	_ = supervisor.start(context.Background(), &testData{})
+	issued := supervisor.issue(context.Background(), testStart, &testData{})
 	resultCh := make(chan Result[testState, testEvent], 1)
 	go func() {
-		resultCh <- supervisor.Verify(context.Background(), issued.Attempt, &testData{})
+		resultCh <- supervisor.verify(context.Background(), issued.AttemptKey, &testData{})
 	}()
 	<-entered
 	fault := supervisor.Trip(errTrip)
@@ -389,23 +405,23 @@ func TestTripRacingVerifyPreventsCommitAndIsFirstCause(t *testing.T) {
 
 func TestRestoreRequiresMatchingDefinitionAndStartupReconciliation(t *testing.T) {
 	machine := MustCompile(validDefinition())
-	if _, err := Restore(machine, Snapshot[testState]{DefinitionID: "other", State: testIdle}, limits()); !errors.Is(err, ErrDefinitionMismatch) {
+	if _, err := Restore(machine, Snapshot[testState, testEvent]{DefinitionID: "other", State: testIdle}, limits()); !errors.Is(err, ErrDefinitionMismatch) {
 		t.Fatalf("definition mismatch = %v", err)
 	}
-	if _, err := Restore(machine, Snapshot[testState]{DefinitionID: machine.ID(), State: testOther}, limits()); !errors.Is(err, ErrUnknownState) {
+	if _, err := Restore(machine, Snapshot[testState, testEvent]{DefinitionID: machine.ID(), ExecutionID: "execution", State: testOther}, limits()); !errors.Is(err, ErrUnknownState) {
 		t.Fatalf("unknown state = %v", err)
 	}
-	supervisor, err := Restore(machine, Snapshot[testState]{DefinitionID: machine.ID(), State: testRunning, Revision: 9}, limits())
+	supervisor, err := Restore(machine, Snapshot[testState, testEvent]{DefinitionID: machine.ID(), ExecutionID: "execution", State: testRunning, Revision: 9, Attempt: 7}, limits())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if supervisor.Status().Mode != ModeStopped {
 		t.Fatalf("Status = %+v", supervisor.Status())
 	}
-	if result := supervisor.Issue(context.Background(), testStart, &testData{}); !errors.Is(result.Err, ErrNotStarted) {
+	if result := supervisor.issue(context.Background(), testStart, &testData{}); !errors.Is(result.Err, ErrNotStarted) {
 		t.Fatalf("Issue = %+v", result)
 	}
-	if result := supervisor.Start(context.Background(), &testData{}); result.Err != nil {
+	if result := supervisor.start(context.Background(), &testData{}); result.Err != nil {
 		t.Fatalf("Start = %+v", result)
 	}
 	if snapshot := supervisor.Snapshot(); snapshot.State != testRunning || snapshot.Revision != 9 {

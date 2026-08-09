@@ -108,7 +108,7 @@ func (i *Instance[S, E, T]) Position() (Position[S], bool) {
 	chart := i.chart
 	active := i.state
 	i.mu.RUnlock()
-	return chart.Position(active)
+	return (&chart).Position(active)
 }
 
 // Active reports the exact active state. The boolean is false for a zero or

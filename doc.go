@@ -36,6 +36,8 @@
 // subpackage supplies a separate strict definition with mandatory checks,
 // explicit issue and verification, finite time limits, startup reconciliation,
 // and first-cause fault latching for safety-adjacent orchestration.
+// It is not a safety controller; see the scope and integration obligations at
+// https://github.com/open-ships/statemachine/blob/main/SAFETY.md
 //
 // # Declaring a machine
 //
@@ -141,10 +143,10 @@
 //     unchanged on a refusal, effect error, or callback panic, but arbitrary
 //     effects may already be partial. Other execution modules document their
 //     own commit points.
-//   - S and E must be strictly comparable. Go's comparable constraint admits
-//     interface types, and those panic on an uncomparable dynamic value.
-//     Prefer distinct defined types for S and E so swapping arguments cannot
-//     compile.
+//   - S and E must be strictly comparable. Compile rejects interface-bearing
+//     types because Go's comparable constraint otherwise admits dynamic values
+//     that cannot be map keys. Prefer distinct defined types for S and E so
+//     swapping arguments cannot compile.
 //   - A Guard must be pure. It is called for rows that lose, and by Permitted.
 //   - A Guard vetoes only if no other row for that From and Event applies.
 //   - [ErrNotPermitted] is a sentinel and travels like one. A Guard or Do that

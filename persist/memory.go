@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sync"
+
+	"github.com/open-ships/statemachine/internal/keycheck"
 )
 
 // Revision is an optimistic concurrency token.
@@ -57,6 +59,9 @@ func NewMemoryStore[K, S comparable](initial map[K]S) *MemoryStore[K, S] {
 func (s *MemoryStore[K, S]) Load(ctx context.Context, key K) (Snapshot[S], error) {
 	if err := ctx.Err(); err != nil {
 		return Snapshot[S]{}, err
+	}
+	if !keycheck.Value(key) {
+		return Snapshot[S]{}, ErrInvalidKey
 	}
 	s.mu.RLock()
 	snapshot, ok := s.entries[key]

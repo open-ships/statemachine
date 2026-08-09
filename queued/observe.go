@@ -2,8 +2,11 @@ package queued
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"github.com/open-ships/statemachine"
+	internalobserver "github.com/open-ships/statemachine/internal/observer"
 )
 
 func copyObservers[S, E comparable, T any](
@@ -23,27 +26,35 @@ func deliverObservations[S, E comparable, T any](
 	ctx context.Context,
 	observations []statemachine.Observation[S, E],
 	data T,
-) {
+) error {
 	if len(observers) == 0 || len(observations) == 0 {
-		return
+		return nil
 	}
-	total := len(observers) * len(observations)
-	for next := 0; next < total; {
-		done := make(chan struct{})
-		start := next
-		go func() {
-			defer close(done)
-			for index := start; index < total; index++ {
-				next = index + 1
-				func() {
-					defer func() { _ = recover() }()
-					observation := observations[index/len(observers)]
-					observer := observers[index%len(observers)]
-					observer(ctx, observation, data)
-				}()
+	var failures []error
+	for _, observation := range observations {
+		for index, observer := range observers {
+			if err := callObserver(index, observer, ctx, observation, data); err != nil {
+				failures = append(failures, err)
 			}
-		}()
-		<-done
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func callObserver[S, E comparable, T any](
+	index int,
+	observer statemachine.Observer[S, E, T],
+	ctx context.Context,
+	observation statemachine.Observation[S, E],
+	data T,
+) error {
+	failure := internalobserver.Call(func() { observer(ctx, observation, data) })
+	if failure == nil {
+		return nil
+	}
+	return &statemachine.ObserverError{
+		Observer: index, Seq: observation.Seq, Value: failure.Value,
+		Stack: failure.Stack, Stopped: failure.Stopped,
 	}
 }
 
@@ -54,16 +65,18 @@ func deliverTransitionObservations[S, E comparable, T any](
 	from, to S,
 	event E,
 	data T,
-) {
+) error {
+	at := time.Now()
 	observations := [...]statemachine.Observation[S, E]{
-		{Seq: step, Step: step, Run: run, Remaining: 1, Move: statemachine.Exited, State: from, Event: event},
-		{Seq: step + 1, Step: step, Run: run, Move: statemachine.Entered, State: to, Event: event},
+		{Seq: step, Step: step, Run: run, Remaining: 1, At: at, Move: statemachine.Exited, State: from, Event: event},
+		{Seq: step + 1, Step: step, Run: run, At: at, Move: statemachine.Entered, State: to, Event: event},
 	}
-	deliverObservations(observers, ctx, observations[:], data)
+	return deliverObservations(observers, ctx, observations[:], data)
 }
 
-func observationContext(ctx context.Context, active func() bool) context.Context {
+func observationContext(ctx context.Context, owner any, active func() bool) context.Context {
 	x := &execution{
+		owner:  owner,
 		active: active,
 		enqueue: func(context.Context, any, any) error {
 			return ErrNotRunning

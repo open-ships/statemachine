@@ -9,8 +9,9 @@
 // the state change. Only work performed through that unit is atomic; a network
 // call made by an effect cannot be rolled back by the Store.
 //
-// A Store must never retry the callback. Effects may have escaped before a
-// version conflict, cancellation, or commit failure is discovered. Retrying is
+// A Store must never retry the callback. Fire and Step enforce one invocation
+// per call and report [ErrStoreContract] if an adapter repeats or omits it.
+// Effects may have escaped before a version conflict, cancellation, or commit failure is discovered. Retrying is
 // therefore a domain decision, not a storage convenience. A caller that does
 // retry should reload first and use a stable idempotency key. An outbox should
 // enforce that key uniquely so a repeated command cannot enqueue two outbox

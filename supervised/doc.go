@@ -8,7 +8,7 @@
 //  1. every global Precondition passes;
 //  2. Guards select the first applicable transition;
 //  3. every transition Precondition and global Invariant passes;
-//  4. Issue runs;
+//  4. an optional durable Journal prepares an in-doubt Snapshot, then Issue runs;
 //  5. a later Verify call establishes application-defined physical completion;
 //  6. Invariants and Postconditions pass; and
 //  7. the logical destination commits and Revision increments.
@@ -24,14 +24,25 @@
 // received, completed, or safely stopped a command. Verify is the application
 // seam for fresh controller and sensor evidence.
 //
+// Every public operation returns both its detailed Result and an ordinary error
+// so errcheck-class tools can detect discarded failures. Attempt identity is
+// Execution ID plus sequence and cannot be reused across a restored Snapshot.
+//
 // Operation and verification limits are mandatory. A timeout cancels the
 // callback context, latches a Fault, and prevents logical commit. Go cannot
 // forcibly terminate arbitrary callback code: a callback that ignores its
 // context may continue mutating external systems. Status reports this as
-// CallbackRunning, and Recover is rejected until it stops.
+// CallbackRunning, and Recover is rejected until the prior Operation call and
+// every callback it started have stopped. Verification admission checks its
+// stored monotonic deadline synchronously; the timer is notification only.
+//
+// NewWithOptions supplies deterministic Clock, durable Journal, and Recorder
+// seams. Lifecycle Records include asynchronous expiry and secondary causes and
+// are retained across Recover. Recorder failure is visible in Status.
 //
 // This package is not a safety-rated controller and must not be the sole path
 // for emergency stop, safe torque off, guarding, collision protection, or
 // human-presence separation. Those functions require an independent,
-// hazard-analyzed safety layer. See the repository's SAFETY.md.
+// hazard-analyzed safety layer. Safety scope and integration obligations:
+// https://github.com/open-ships/statemachine/blob/main/SAFETY.md
 package supervised

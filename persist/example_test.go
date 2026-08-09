@@ -58,7 +58,7 @@ func sqlStore[S comparable](db *sql.DB, scanState func(*sql.Row) (S, uint64, err
 			if err != nil {
 				return zero, err
 			}
-			defer tx.Rollback()
+			defer func() { _ = tx.Rollback() }()
 
 			from, version, err := scanState(tx.QueryRowContext(ctx,
 				`SELECT state, version FROM aggregates WHERE id = ?`, id))

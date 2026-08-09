@@ -160,6 +160,7 @@ func TestRootCascadesAndExternalRootsRunFIFO(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var order []event
+	var r *queued.Runtime[state, event, *command]
 	m := statemachine.MustCompile([]row{
 		{
 			From: 0, Event: start, To: 1,
@@ -167,10 +168,10 @@ func TestRootCascadesAndExternalRootsRunFIFO(t *testing.T) {
 				order = append(order, start)
 				close(entered)
 				<-release
-				if err := queued.Enqueue(ctx, first, data); err != nil {
+				if err := r.Enqueue(ctx, first, data); err != nil {
 					return err
 				}
-				return queued.Enqueue(ctx, second, data)
+				return r.Enqueue(ctx, second, data)
 			},
 		},
 		{
@@ -195,7 +196,7 @@ func TestRootCascadesAndExternalRootsRunFIFO(t *testing.T) {
 			},
 		},
 	})
-	r := queued.New(m, state(0))
+	r = queued.New(m, state(0))
 
 	firstDone := fireAsync(r, context.Background(), start)
 	await(t, entered)
@@ -233,7 +234,7 @@ func TestRuntimeObservesEveryCommittedStepInOneRun(t *testing.T) {
 
 	m := statemachine.MustCompile([]row{
 		{From: 0, Event: start, To: 1, Do: func(ctx context.Context, _ *command) error {
-			return queued.Enqueue(ctx, first, followData)
+			return r.Enqueue(ctx, first, followData)
 		}},
 		{From: 1, Event: first, To: 2},
 		{From: 2, Event: after, To: 3},
@@ -242,7 +243,7 @@ func TestRuntimeObservesEveryCommittedStepInOneRun(t *testing.T) {
 		observations = append(observations, observation)
 		values = append(values, data.value)
 		observedStates = append(observedStates, r.State())
-		enqueueErrors = append(enqueueErrors, queued.Enqueue(observerCtx, never, data))
+		enqueueErrors = append(enqueueErrors, r.Enqueue(observerCtx, never, data))
 		_, err := r.Fire(observerCtx, after, data)
 		fireErrors = append(fireErrors, err)
 		contexts = append(contexts, observerCtx.Value(contextKey{}))
@@ -261,11 +262,11 @@ func TestRuntimeObservesEveryCommittedStepInOneRun(t *testing.T) {
 		observer,
 	)
 
-	if got, err := r.Fire(ctx, start, rootData); err != nil || got != 2 {
-		t.Fatalf("root Fire = (%v, %v), want (2, nil)", got, err)
+	if got, err := r.Fire(ctx, start, rootData); !errors.Is(err, statemachine.ErrObserverFailed) || got != 2 {
+		t.Fatalf("root Fire = (%v, %v), want (2, ObserverError)", got, err)
 	}
-	if got, err := r.Fire(ctx, after, rootData); err != nil || got != 3 {
-		t.Fatalf("later Fire = (%v, %v), want (3, nil)", got, err)
+	if got, err := r.Fire(ctx, after, rootData); !errors.Is(err, statemachine.ErrObserverFailed) || got != 3 {
+		t.Fatalf("later Fire = (%v, %v), want (3, ObserverError)", got, err)
 	}
 	want := []statemachine.Observation[state, event]{
 		{Seq: 1, Step: 1, Run: 1, Remaining: 1, Move: statemachine.Exited, State: 0, Event: start},
@@ -274,6 +275,14 @@ func TestRuntimeObservesEveryCommittedStepInOneRun(t *testing.T) {
 		{Seq: 4, Step: 3, Run: 1, Move: statemachine.Entered, State: 2, Event: first},
 		{Seq: 5, Step: 5, Run: 5, Remaining: 1, Move: statemachine.Exited, State: 2, Event: after},
 		{Seq: 6, Step: 5, Run: 5, Move: statemachine.Entered, State: 3, Event: after},
+	}
+	for index := range observations {
+		if observations[index].At.IsZero() || (index%2 == 1 && observations[index].At != observations[index-1].At) {
+			t.Fatalf("observation timestamps = %+v", observations)
+		}
+	}
+	for index := range observations {
+		observations[index].At = want[index].At
 	}
 	if !slices.Equal(observations, want) {
 		t.Fatalf("observations = %+v, want %+v", observations, want)
@@ -297,14 +306,15 @@ func TestRuntimeObservesEveryCommittedStepInOneRun(t *testing.T) {
 func TestRuntimeSilentSelfRootAnchorsRunAtFirstChangingFollowup(t *testing.T) {
 	selfCalls := 0
 	var observations []statemachine.Observation[state, event]
+	var r *queued.Runtime[state, event, *command]
 	m := statemachine.MustCompile([]row{
 		{From: 0, Event: start, To: 0, Do: func(ctx context.Context, data *command) error {
 			selfCalls++
-			return queued.Enqueue(ctx, first, data)
+			return r.Enqueue(ctx, first, data)
 		}},
 		{From: 0, Event: first, To: 1},
 	})
-	r := queued.NewWithObservers(m, state(0), func(
+	r = queued.NewWithObservers(m, state(0), func(
 		_ context.Context, observation statemachine.Observation[state, event], _ *command,
 	) {
 		observations = append(observations, observation)
@@ -316,6 +326,14 @@ func TestRuntimeSilentSelfRootAnchorsRunAtFirstChangingFollowup(t *testing.T) {
 	want := []statemachine.Observation[state, event]{
 		{Seq: 1, Step: 1, Run: 1, Remaining: 1, Move: statemachine.Exited, State: 0, Event: first},
 		{Seq: 2, Step: 1, Run: 1, Move: statemachine.Entered, State: 1, Event: first},
+	}
+	for index := range observations {
+		if observations[index].At.IsZero() || (index > 0 && observations[index].At != observations[0].At) {
+			t.Fatalf("observation timestamps = %+v", observations)
+		}
+	}
+	for index := range observations {
+		observations[index].At = want[index].At
 	}
 	if selfCalls != 1 || !slices.Equal(observations, want) {
 		t.Fatalf("self calls/observations = %d/%+v", selfCalls, observations)
@@ -344,10 +362,10 @@ func TestReentrantFireIsRejectedAndEnqueueContextExpires(t *testing.T) {
 	if nestedState != 5 || nestedErr != queued.ErrReentrant {
 		t.Fatalf("nested Fire = (%v, %v), want (5, ErrReentrant)", nestedState, nestedErr)
 	}
-	if err := queued.Enqueue(context.Background(), after, &command{}); err != queued.ErrNotRunning {
+	if err := r.Enqueue(context.Background(), after, &command{}); err != queued.ErrNotRunning {
 		t.Fatalf("Enqueue with ordinary context = %v, want ErrNotRunning", err)
 	}
-	if err := queued.Enqueue(executionCtx, after, &command{}); err != queued.ErrNotRunning {
+	if err := r.Enqueue(executionCtx, after, &command{}); err != queued.ErrNotRunning {
 		t.Fatalf("Enqueue with expired context = %v, want ErrNotRunning", err)
 	}
 	if _, err := r.Fire(executionCtx, after, &command{}); !errors.Is(err, statemachine.ErrNotPermitted) {
@@ -418,8 +436,8 @@ func TestCanceledRootIsSkippedWhenItsTurnArrives(t *testing.T) {
 		t.Fatalf("first root = (%v, %v), want (1, nil)", got.state, got.err)
 	}
 	got := await(t, secondDone)
-	if got.state != 1 || !errors.Is(got.err, context.Canceled) {
-		t.Fatalf("canceled root = (%v, %v), want (1, context.Canceled)", got.state, got.err)
+	if (got.state != 0 && got.state != 1) || !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("canceled root = (%v, %v), want current state and context.Canceled", got.state, got.err)
 	}
 	if skippedCalls.Load() != 0 || r.State() != 1 {
 		t.Fatalf("skipped calls/state = %v/%v, want 0/1", skippedCalls.Load(), r.State())
@@ -428,13 +446,14 @@ func TestCanceledRootIsSkippedWhenItsTurnArrives(t *testing.T) {
 
 func TestCanceledFollowupAbortsOnlyItsRoot(t *testing.T) {
 	var followCalls atomic.Int32
+	var r *queued.Runtime[state, event, *command]
 	m := statemachine.MustCompile([]row{
 		{
 			From: 0, Event: start, To: 1,
 			Do: func(ctx context.Context, data *command) error {
 				child, cancel := context.WithCancel(ctx)
 				defer cancel()
-				if err := queued.Enqueue(child, first, data); err != nil {
+				if err := r.Enqueue(child, first, data); err != nil {
 					return err
 				}
 				return nil
@@ -449,7 +468,7 @@ func TestCanceledFollowupAbortsOnlyItsRoot(t *testing.T) {
 		},
 		{From: 1, Event: after, To: 3},
 	})
-	r := queued.New(m, state(0))
+	r = queued.New(m, state(0))
 
 	got, err := r.Fire(context.Background(), start, &command{})
 	if got != 1 || !errors.Is(err, context.Canceled) {
@@ -469,14 +488,15 @@ func TestErrorDropsFollowupsWithoutStrandingLaterRoot(t *testing.T) {
 	failing := make(chan struct{})
 	release := make(chan struct{})
 	var neverCalls atomic.Int32
+	var r *queued.Runtime[state, event, *command]
 	m := statemachine.MustCompile([]row{
 		{
 			From: 0, Event: start, To: 1,
 			Do: func(ctx context.Context, data *command) error {
-				if err := queued.Enqueue(ctx, fail, data); err != nil {
+				if err := r.Enqueue(ctx, fail, data); err != nil {
 					return err
 				}
-				return queued.Enqueue(ctx, never, data)
+				return r.Enqueue(ctx, never, data)
 			},
 		},
 		{
@@ -496,7 +516,7 @@ func TestErrorDropsFollowupsWithoutStrandingLaterRoot(t *testing.T) {
 		},
 		{From: 1, Event: after, To: 3},
 	})
-	r := queued.New(m, state(0))
+	r = queued.New(m, state(0))
 
 	rootDone := fireAsync(r, context.Background(), start)
 	await(t, failing)
@@ -521,14 +541,15 @@ func TestPanicIsReplayedDropsFollowupsAndLaterRootRuns(t *testing.T) {
 	panicking := make(chan struct{})
 	release := make(chan struct{})
 	var neverCalls atomic.Int32
+	var r *queued.Runtime[state, event, *command]
 	m := statemachine.MustCompile([]row{
 		{
 			From: 0, Event: start, To: 1,
 			Do: func(ctx context.Context, data *command) error {
-				if err := queued.Enqueue(ctx, fail, data); err != nil {
+				if err := r.Enqueue(ctx, fail, data); err != nil {
 					return err
 				}
-				return queued.Enqueue(ctx, never, data)
+				return r.Enqueue(ctx, never, data)
 			},
 		},
 		{
@@ -548,7 +569,7 @@ func TestPanicIsReplayedDropsFollowupsAndLaterRootRuns(t *testing.T) {
 		},
 		{From: 1, Event: after, To: 3},
 	})
-	r := queued.New(m, state(0))
+	r = queued.New(m, state(0))
 
 	panicDone := make(chan any, 1)
 	go func() {
@@ -654,20 +675,21 @@ func TestConcurrentRootsAreSerialized(t *testing.T) {
 func TestEnqueueSupportsRuntimeWithInterfaceData(t *testing.T) {
 	type anyRow = statemachine.Transition[state, event, any]
 	var seen []any
+	var r *queued.Runtime[state, event, any]
 	m := statemachine.MustCompile([]anyRow{
 		{
 			From: 0, Event: start, To: 1,
 			Do: func(ctx context.Context, _ any) error {
 				// T is inferred as string here; it is still assignable to the
 				// Runtime's any data type.
-				return queued.Enqueue(ctx, first, "follow-up")
+				return r.Enqueue(ctx, first, "follow-up")
 			},
 		},
 		{
 			From: 1, Event: first, To: 2,
 			Do: func(ctx context.Context, data any) error {
 				seen = append(seen, data)
-				return queued.Enqueue[event, any](ctx, second, nil)
+				return r.Enqueue(ctx, second, nil)
 			},
 		},
 		{
@@ -678,7 +700,7 @@ func TestEnqueueSupportsRuntimeWithInterfaceData(t *testing.T) {
 			},
 		},
 	})
-	r := queued.New(m, state(0))
+	r = queued.New(m, state(0))
 
 	got, err := r.Fire(context.Background(), start, nil)
 	if got != 3 || err != nil {
@@ -689,38 +711,11 @@ func TestEnqueueSupportsRuntimeWithInterfaceData(t *testing.T) {
 	}
 }
 
-func TestEnqueueRejectsNilContextAndMismatchedTypes(t *testing.T) {
-	if err := queued.Enqueue[event, *command](nil, first, nil); err != queued.ErrNotRunning {
+func TestRuntimeEnqueueRejectsNilContext(t *testing.T) {
+	r := queued.New(statemachine.MustCompile([]row{{From: 0, Event: start, To: 1}}), state(0))
+	//lint:ignore SA1012 This test verifies the defensive nil-context result.
+	if err := r.Enqueue(nil, first, nil); err != queued.ErrNotRunning {
 		t.Fatalf("Enqueue with nil context = %v, want ErrNotRunning", err)
-	}
-
-	for _, test := range []struct {
-		name string
-		do   func(context.Context, *command) error
-	}{
-		{
-			name: "event",
-			do: func(ctx context.Context, data *command) error {
-				return queued.Enqueue(ctx, string(first), data)
-			},
-		},
-		{
-			name: "data",
-			do: func(ctx context.Context, _ *command) error {
-				return queued.Enqueue(ctx, first, command{})
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			m := statemachine.MustCompile([]row{{
-				From: 0, Event: start, To: 1, Do: test.do,
-			}})
-			r := queued.New(m, state(0))
-			got, err := r.Fire(context.Background(), start, &command{})
-			if got != 0 || err != queued.ErrNotRunning {
-				t.Fatalf("Fire = (%v, %v), want (0, ErrNotRunning)", got, err)
-			}
-		})
 	}
 }
 
