@@ -29,4 +29,4 @@ previously drafted 2.0.0 was never tagged and its changes land here.
 - Detect Store callback contract violations and unsafe generic map keys.
 - Timestamp committed Observations and return contained Observer failures after commit with their original stacks.
 - Add supervisor model fuzzing, logical/external benchmarks, static analysis, coverage retention, and requirements traceability.
-- Publish successful current-main builds automatically as annotated releases with retained assurance artifacts, using `VERSION` as the next baseline and incrementing patch versions thereafter.
+- Publish successful current-main builds through the shared Open Ships release policy as annotated releases with checksums, an SBOM, separate build-provenance and SBOM attestations, and retained assurance artifacts; use `VERSION` as the next baseline and increment patch versions thereafter.
