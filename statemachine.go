@@ -115,6 +115,13 @@ type key[S, E comparable] struct {
 type Machine[S, E comparable, T any] struct {
 	rows   map[key[S, E]][]Transition[S, E, T]
 	events map[S][]E // per state, each event once, in first-mention order
+
+	// strict records that Compile proved S and E free of interface-bearing
+	// types, so no dynamic value of either can be an uncomparable map key.
+	// Strictness is a property of the type: once proved at compile time, the
+	// per-value reflection check in Fire and Permitted is unnecessary. The
+	// zero Machine has not been through Compile and keeps the per-value check.
+	strict bool
 }
 
 // Compile builds a [Machine] from a transition table. It copies transitions, so
@@ -146,6 +153,7 @@ func Compile[S, E comparable, T any](transitions []Transition[S, E, T]) (*Machin
 	m := &Machine[S, E, T]{
 		rows:   make(map[key[S, E]][]Transition[S, E, T], len(transitions)),
 		events: make(map[S][]E),
+		strict: true,
 	}
 	// Once a group has an unguarded row, every later row in that group is dead.
 	unguarded := make(map[key[S, E]]int, len(transitions))
@@ -220,7 +228,7 @@ func MustCompile[S, E comparable, T any](transitions []Transition[S, E, T]) *Mac
 // distinct aggregates, and never fire the machine that owns the state the
 // current transition is advancing.
 func (m *Machine[S, E, T]) Fire(ctx context.Context, from S, event E, data T) (S, error) {
-	if !keycheck.Value(from) || !keycheck.Value(event) {
+	if !m.strict && (!keycheck.Value(from) || !keycheck.Value(event)) {
 		return from, ErrInvalidKey
 	}
 	var reasons []error
@@ -266,7 +274,7 @@ func (m *Machine[S, E, T]) Fire(ctx context.Context, from S, event E, data T) (S
 // [ErrNotPermitted] cannot go stale between the question and the answer.
 func (m *Machine[S, E, T]) Permitted(ctx context.Context, from S, data T) iter.Seq2[E, S] {
 	return func(yield func(E, S) bool) {
-		if !keycheck.Value(from) {
+		if !m.strict && !keycheck.Value(from) {
 			return
 		}
 		for _, event := range m.events[from] {

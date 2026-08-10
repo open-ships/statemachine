@@ -37,8 +37,22 @@
 // stored monotonic deadline synchronously; the timer is notification only.
 //
 // NewWithOptions supplies deterministic Clock, durable Journal, and Recorder
-// seams. Lifecycle Records include asynchronous expiry and secondary causes and
-// are retained across Recover. Recorder failure is visible in Status.
+// seams. A Machine that declares external Issue actions requires a Journal by
+// default; Options.Unjournaled is the explicitly named waiver for tests and
+// non-hazardous work. The Journal receives an in-doubt Snapshot before Issue
+// and a closure Snapshot after every commit, freshly latched Fault, and
+// completed recovery, so a restart can always distinguish closed work from
+// in-doubt work.
+//
+// Lifecycle Records are identified by (ExecutionID, Restarts, Seq), assigned
+// atomically with the state decision each describes, bounded in memory by
+// Limits.MaxRecords, and retained across Recover. Recorder and Journal
+// failures are visible in Status and never rewrite a completed outcome.
+//
+// A latched Fault is resolved by Recover, which validates and retains the
+// committed state, or by Adjudicate, which records an explicit Decision to
+// retain the state, adopt the in-doubt Change's destination on controller
+// evidence, or override to a declared minimum-risk state.
 //
 // This package is not a safety-rated controller and must not be the sole path
 // for emergency stop, safe torque off, guarding, collision protection, or

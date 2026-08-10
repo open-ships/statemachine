@@ -131,6 +131,7 @@ type compiledTransition[S, E comparable, T any] struct {
 type Machine[S, E comparable, T any] struct {
 	id             string
 	initial        S
+	external       bool
 	states         []StateInfo[S]
 	events         []E
 	stateIndex     map[S]StateInfo[S]
@@ -274,7 +275,11 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Machine[S
 	transitionInfos := make([]TransitionInfo[S, E], 0, len(definition.Transitions))
 	idAt := make(map[string]int, len(definition.Transitions))
 	unguarded := make(map[transitionKey[S, E]]int, len(definition.Transitions))
+	external := false
 	for index, transition := range definition.Transitions {
+		if transition.Issue != nil {
+			external = true
+		}
 		if strings.TrimSpace(transition.ID) == "" {
 			problems = append(problems, fmt.Errorf("supervised: transitions[%d] has an empty ID", index))
 		} else if previous, duplicate := idAt[transition.ID]; duplicate {
@@ -390,7 +395,7 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Machine[S
 		return nil, errors.Join(problems...)
 	}
 	return &Machine[S, E, T]{
-		id: definition.ID, initial: definition.Initial,
+		id: definition.ID, initial: definition.Initial, external: external,
 		states: states, events: events, stateIndex: stateIndex, eventSet: copySet(eventAt),
 		refused: refused, transitions: transitionInfos, rows: rows,
 		preconditions:  append([]Precondition[S, E, T](nil), definition.Preconditions...),
@@ -446,6 +451,15 @@ func (m *Machine[S, E, T]) ID() string {
 		return ""
 	}
 	return m.id
+}
+
+// External reports whether any transition declares an external Issue action.
+// Supervisors for such a Machine require a durable Journal by default.
+func (m *Machine[S, E, T]) External() bool {
+	if m == nil {
+		return false
+	}
+	return m.external
 }
 
 // Initial reports the definition's canonical initial state. The boolean is

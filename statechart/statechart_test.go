@@ -110,7 +110,7 @@ func TestZeroInstanceRefusesWithoutPanicking(t *testing.T) {
 	if got := instance.State(); got != "" {
 		t.Fatalf("zero State = %q", got)
 	}
-	if err := instance.Fire(context.Background(), goB, &testData{}); !errors.Is(err, statechart.ErrNotPermitted) {
+	if _, err := instance.Fire(context.Background(), goB, &testData{}); !errors.Is(err, statechart.ErrNotPermitted) {
 		t.Fatalf("zero Fire = %v, want ErrNotPermitted", err)
 	}
 	var count int
@@ -317,7 +317,7 @@ func TestDefinitionIsCopied(t *testing.T) {
 	states[1].Entry[0] = record("mutated entry")
 	transitions[0].Do = record("mutated effect")
 	instance, _ := chart.New(a)
-	if err := instance.Fire(context.Background(), goB, data); err != nil {
+	if _, err := instance.Fire(context.Background(), goB, data); err != nil {
 		t.Fatalf("Fire: %v", err)
 	}
 	if want := []string{"original exit", "original effect", "original entry"}; !slices.Equal(data.trace, want) {
@@ -348,7 +348,7 @@ func TestInheritedLookupFallsBackThroughDeclinedGuards(t *testing.T) {
 	})
 	instance, _ := chart.New(a1)
 	data := &testData{}
-	if err := instance.Fire(context.Background(), goB, data); err != nil {
+	if _, err := instance.Fire(context.Background(), goB, data); err != nil {
 		t.Fatalf("Fire: %v", err)
 	}
 	if instance.State() != b || !slices.Equal(data.trace, []string{"root handled"}) {
@@ -370,7 +370,7 @@ func TestInheritedLookupFallsBackThroughDeclinedGuards(t *testing.T) {
 		},
 	})
 	instance, _ = refusing.New(a1)
-	err := instance.Fire(context.Background(), goB, data)
+	_, err := instance.Fire(context.Background(), goB, data)
 	for _, want := range []error{statechart.ErrNotPermitted, errLeaf, errParent} {
 		if !errors.Is(err, want) {
 			t.Errorf("errors.Is(%v) = false; err = %v", want, err)
@@ -417,7 +417,7 @@ func TestExternalTransitionOrdersLifecycleAroundCommit(t *testing.T) {
 	})
 	instance, _ = chart.New(a1)
 	data := &testData{}
-	if err := instance.Fire(context.Background(), goB, data); err != nil {
+	if _, err := instance.Fire(context.Background(), goB, data); err != nil {
 		t.Fatalf("Fire: %v", err)
 	}
 	want := []string{"exit a1:a1", "exit a:a1", "effect:a1", "enter b:a1", "enter b1:a1"}
@@ -442,7 +442,7 @@ func TestExternalTransitionUsesActiveTargetLCAForAncestorAndDescendant(t *testin
 		})
 		instance, _ := chart.New(a1)
 		data := &testData{}
-		if err := instance.Fire(context.Background(), reset, data); err != nil {
+		if _, err := instance.Fire(context.Background(), reset, data); err != nil {
 			t.Fatal(err)
 		}
 		want := []string{"exit a1", "effect", "enter a2"}
@@ -464,7 +464,7 @@ func TestExternalTransitionUsesActiveTargetLCAForAncestorAndDescendant(t *testin
 		})
 		instance, _ := chart.New(a)
 		data := &testData{}
-		if err := instance.Fire(context.Background(), goB, data); err != nil {
+		if _, err := instance.Fire(context.Background(), goB, data); err != nil {
 			t.Fatal(err)
 		}
 		want := []string{"effect", "enter a1"}
@@ -491,7 +491,7 @@ func TestInternalTransitionRunsOnlyEffectAndKeepsLeaf(t *testing.T) {
 	})
 	instance, _ := chart.New(a1)
 	data := &testData{}
-	if err := instance.Fire(context.Background(), touch, data); err != nil {
+	if _, err := instance.Fire(context.Background(), touch, data); err != nil {
 		t.Fatal(err)
 	}
 	if instance.State() != a1 || !slices.Equal(data.trace, []string{"effect"}) {
@@ -517,7 +517,7 @@ func TestReentryExitsThroughHandlerAndEntersItsInitialChain(t *testing.T) {
 		observations = append(observations, observation)
 	})
 	data := &testData{}
-	if err := instance.Fire(context.Background(), reset, data); err != nil {
+	if _, err := instance.Fire(context.Background(), reset, data); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"exit a1", "exit a", "effect", "enter a", "enter a2"}
@@ -571,7 +571,8 @@ func TestStatechartObservesEveryCommittedNodeAfterEntryProcessing(t *testing.T) 
 		}
 		active, _ := position.Active()
 		activeStates = append(activeStates, active)
-		nestedErrors = append(nestedErrors, instance.Fire(observerCtx, goB, observed))
+		_, nestedFireErr := instance.Fire(observerCtx, goB, observed)
+		nestedErrors = append(nestedErrors, nestedFireErr)
 	}
 
 	chart := statechart.MustCompile(definition{
@@ -597,7 +598,7 @@ func TestStatechartObservesEveryCommittedNodeAfterEntryProcessing(t *testing.T) 
 	if len(observations) != 0 {
 		t.Fatal("restoration emitted observations")
 	}
-	if err := instance.Fire(ctx, goB, data); err != nil {
+	if _, err := instance.Fire(ctx, goB, data); err != nil {
 		t.Fatal(err)
 	}
 
@@ -655,7 +656,7 @@ func TestStatechartEntryFailuresRemainUncommittedAndSilent(t *testing.T) {
 			var recovered any
 			func() {
 				defer func() { recovered = recover() }()
-				err = instance.Fire(context.Background(), goB, &testData{})
+				_, err = instance.Fire(context.Background(), goB, &testData{})
 			}()
 			if test.name == "error" {
 				var actionErr *statechart.ActionError
@@ -700,7 +701,7 @@ func TestStatechartEntryGoexitRemainsUncommittedAndSilent(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = instance.Fire(context.Background(), goB, &testData{})
+		_, _ = instance.Fire(context.Background(), goB, &testData{})
 	}()
 	select {
 	case <-done:
@@ -713,7 +714,7 @@ func TestStatechartEntryGoexitRemainsUncommittedAndSilent(t *testing.T) {
 	if panicCalls != 0 || goexitCalls != 0 {
 		t.Fatalf("failed observer calls = panic %d, Goexit %d; want 0 each", panicCalls, goexitCalls)
 	}
-	if err := instance.Fire(context.Background(), unknownEvent, &testData{}); errors.Is(err, statechart.ErrInFlight) {
+	if _, err := instance.Fire(context.Background(), unknownEvent, &testData{}); errors.Is(err, statechart.ErrInFlight) {
 		t.Fatalf("in-flight survived Goexit: %v", err)
 	}
 }
@@ -735,7 +736,7 @@ func TestStatechartPrecommitFailuresAndInternalTransitionsAreObservationSilent(t
 				Transitions: []transition{{From: a, Event: goB, To: b, Do: test.effect}},
 			})
 			instance, _ := chart.NewWithObservers(a, func(context.Context, statechart.Observation[testState, testEvent], *testData) { calls++ })
-			if err := instance.Fire(context.Background(), goB, &testData{}); !errors.Is(err, sentinel) {
+			if _, err := instance.Fire(context.Background(), goB, &testData{}); !errors.Is(err, sentinel) {
 				t.Fatalf("Fire = %v", err)
 			}
 			if calls != 0 || instance.State() != a {
@@ -750,7 +751,7 @@ func TestStatechartPrecommitFailuresAndInternalTransitionsAreObservationSilent(t
 		Transitions: []transition{{From: a, Event: touch, To: a, Kind: statechart.Internal}},
 	})
 	instance, _ := chart.NewWithObservers(a, func(context.Context, statechart.Observation[testState, testEvent], *testData) { calls++ })
-	if err := instance.Fire(context.Background(), touch, &testData{}); err != nil || calls != 0 {
+	if _, err := instance.Fire(context.Background(), touch, &testData{}); err != nil || calls != 0 {
 		t.Fatalf("internal Fire/calls = %v/%d", err, calls)
 	}
 }
@@ -776,7 +777,7 @@ func TestActionErrorReportsPhaseAndCommitPoint(t *testing.T) {
 				Transitions: []transition{{From: a, Event: goB, To: b, Do: test.effect}},
 			})
 			instance, _ := chart.New(a)
-			err := instance.Fire(context.Background(), goB, &testData{})
+			_, err := instance.Fire(context.Background(), goB, &testData{})
 			var actionErr *statechart.ActionError
 			if !errors.As(err, &actionErr) || !errors.Is(err, sentinel) {
 				t.Fatalf("err = %#v", err)
@@ -838,13 +839,13 @@ func TestPanicPreservesCommitPointAndClearsInFlight(t *testing.T) {
 						t.Error("Fire did not propagate panic")
 					}
 				}()
-				_ = instance.Fire(context.Background(), goB, &testData{})
+				_, _ = instance.Fire(context.Background(), goB, &testData{})
 			}()
 			want := a
 			if instance.State() != want {
 				t.Fatalf("State after panic = %v, want %v", instance.State(), want)
 			}
-			if err := instance.Fire(context.Background(), goB, &testData{}); err != nil {
+			if _, err := instance.Fire(context.Background(), goB, &testData{}); err != nil {
 				t.Fatalf("Fire after panic: %v", err)
 			}
 		})
@@ -866,7 +867,7 @@ func TestGoexitClearsInFlightAndPreservesCommitPoint(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = instance.Fire(context.Background(), goB, &testData{})
+		_, _ = instance.Fire(context.Background(), goB, &testData{})
 	}()
 	select {
 	case <-done:
@@ -876,7 +877,7 @@ func TestGoexitClearsInFlightAndPreservesCommitPoint(t *testing.T) {
 	if got := instance.State(); got != a {
 		t.Fatalf("State after Goexit = %v, want %v", got, a)
 	}
-	if err := instance.Fire(context.Background(), unknownEvent, &testData{}); !errors.Is(err, statechart.ErrNotPermitted) {
+	if _, err := instance.Fire(context.Background(), unknownEvent, &testData{}); !errors.Is(err, statechart.ErrNotPermitted) {
 		t.Fatalf("Fire after Goexit = %v, want ordinary refusal", err)
 	}
 }
@@ -894,12 +895,15 @@ func TestConcurrentAndReentrantFireReturnErrInFlight(t *testing.T) {
 	})
 	instance, _ := chart.New(a)
 	done := make(chan error, 1)
-	go func() { done <- instance.Fire(context.Background(), goB, &testData{}) }()
+	go func() {
+		_, err := instance.Fire(context.Background(), goB, &testData{})
+		done <- err
+	}()
 	<-started
 	if instance.State() != a {
 		t.Fatalf("State during effect = %v, want %v", instance.State(), a)
 	}
-	if err := instance.Fire(context.Background(), goB, &testData{}); !errors.Is(err, statechart.ErrInFlight) {
+	if _, err := instance.Fire(context.Background(), goB, &testData{}); !errors.Is(err, statechart.ErrInFlight) {
 		t.Fatalf("overlapping Fire error = %v", err)
 	}
 	close(release)
@@ -912,12 +916,12 @@ func TestConcurrentAndReentrantFireReturnErrInFlight(t *testing.T) {
 	reentrantChart := statechart.MustCompile(definition{
 		States: []state{{Name: a}, {Name: b}},
 		Transitions: []transition{{From: a, Event: goB, To: b, Do: func(ctx context.Context, _ statechart.Info[testState, testEvent], data *testData) error {
-			nested = reentrant.Fire(ctx, goB, data)
+			_, nested = reentrant.Fire(ctx, goB, data)
 			return nil
 		}}},
 	})
 	reentrant, _ = reentrantChart.New(a)
-	if err := reentrant.Fire(context.Background(), goB, &testData{}); err != nil {
+	if _, err := reentrant.Fire(context.Background(), goB, &testData{}); err != nil {
 		t.Fatal(err)
 	}
 	if !errors.Is(nested, statechart.ErrInFlight) {
@@ -991,7 +995,7 @@ func TestInstanceIsRaceSafeForStateAndRefusesUnknownEvent(t *testing.T) {
 		wait.Go(func() { _ = instance.State() })
 	}
 	wait.Wait()
-	err := instance.Fire(context.Background(), unknownEvent, &testData{})
+	_, err := instance.Fire(context.Background(), unknownEvent, &testData{})
 	if !errors.Is(err, statechart.ErrNotPermitted) || instance.State() != a {
 		t.Fatalf("Fire = %v, state = %v", err, instance.State())
 	}
@@ -1058,8 +1062,8 @@ func BenchmarkStatechartFire(b *testing.B) {
 	data := &testData{}
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = instance.Fire(context.Background(), goB, data)
-		_ = instance.Fire(context.Background(), reset, data)
+		_, _ = instance.Fire(context.Background(), goB, data)
+		_, _ = instance.Fire(context.Background(), reset, data)
 	}
 }
 
@@ -1072,8 +1076,8 @@ func BenchmarkStatechartFireObserved(b *testing.B) {
 	data := &testData{}
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = instance.Fire(context.Background(), goB, data)
-		_ = instance.Fire(context.Background(), reset, data)
+		_, _ = instance.Fire(context.Background(), goB, data)
+		_, _ = instance.Fire(context.Background(), reset, data)
 	}
 }
 
@@ -1098,7 +1102,7 @@ func TestInstanceOwnsCompiledChartValue(t *testing.T) {
 		Transitions: []transition{{From: a, Event: goB, To: b1}},
 	})
 	*original = *replacement
-	if err := instance.Fire(context.Background(), goB, &testData{}); err != nil || instance.State() != b {
+	if _, err := instance.Fire(context.Background(), goB, &testData{}); err != nil || instance.State() != b {
 		t.Fatalf("Fire after caller overwrite = state %v, err %v", instance.State(), err)
 	}
 }
@@ -1115,7 +1119,7 @@ func TestSuccessfulStatechartObserverFailuresAreReturnedAfterCommit(t *testing.T
 		func(context.Context, statechart.Observation[testState, testEvent], *testData) { runtime.Goexit() },
 		func(context.Context, statechart.Observation[testState, testEvent], *testData) { delivered++ },
 	)
-	err := instance.Fire(context.Background(), goB, &testData{})
+	_, err := instance.Fire(context.Background(), goB, &testData{})
 	var observerErr *statemachine.ObserverError
 	if instance.State() != b || delivered != 2 || !errors.Is(err, statemachine.ErrObserverFailed) ||
 		!errors.As(err, &observerErr) || observerErr.Stack == "" {
@@ -1140,7 +1144,7 @@ func TestStatechartObserversComposesAndIsolatesCallbacks(t *testing.T) {
 		func(context.Context, statechart.Observation[testState, testEvent], *testData) { delivered++ },
 	)
 	instance, _ := chart.NewWithObservers(a, combined)
-	err := instance.Fire(context.Background(), goB, &testData{})
+	_, err := instance.Fire(context.Background(), goB, &testData{})
 	if instance.State() != b || delivered != 2 || !errors.Is(err, statemachine.ErrObserverFailed) {
 		t.Fatalf("Fire = state %v, delivered %d, err %v", instance.State(), delivered, err)
 	}

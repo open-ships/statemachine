@@ -73,7 +73,7 @@ func tracedDefinition() Definition[testState, testEvent, *testData] {
 
 func TestIssueVerifyCommitAndSnapshot(t *testing.T) {
 	machine := MustCompile(tracedDefinition())
-	supervisor, err := New(machine, limits())
+	supervisor, err := newUnjournaled(machine, limits())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestPureLogicalTransitionCommitsDuringIssue(t *testing.T) {
 	definition.Transitions[0].Issue = nil
 	definition.Transitions[0].Verify = nil
 	machine := MustCompile(definition)
-	supervisor, _ := New(machine, limits())
+	supervisor, _ := newUnjournaled(machine, limits())
 	data := &testData{}
 	if result := supervisor.start(context.Background(), data); result.Err != nil {
 		t.Fatal(result.Err)
@@ -167,7 +167,7 @@ func TestPreconditionsCannotFallThroughAndGuardRefusalDoesNotFault(t *testing.T)
 		},
 	}
 	machine := MustCompile(definition)
-	supervisor, _ := New(machine, limits())
+	supervisor, _ := newUnjournaled(machine, limits())
 	if result := supervisor.start(context.Background(), &testData{}); result.Err != nil {
 		t.Fatal(result.Err)
 	}
@@ -179,7 +179,7 @@ func TestPreconditionsCannotFallThroughAndGuardRefusalDoesNotFault(t *testing.T)
 	guardOnly := validDefinition()
 	guardOnly.Transitions[0].Guard = func(context.Context, Change[testState, testEvent], *testData) error { return errVerify }
 	machine = MustCompile(guardOnly)
-	supervisor, _ = New(machine, limits())
+	supervisor, _ = newUnjournaled(machine, limits())
 	_ = supervisor.start(context.Background(), &testData{})
 	result = supervisor.issue(context.Background(), testStart, &testData{})
 	if !errors.Is(result.Err, ErrNotPermitted) || !errors.Is(result.Err, errVerify) ||
@@ -189,7 +189,7 @@ func TestPreconditionsCannotFallThroughAndGuardRefusalDoesNotFault(t *testing.T)
 }
 
 func TestIssueDistinguishesUndeclaredEvent(t *testing.T) {
-	supervisor, _ := New(MustCompile(validDefinition()), limits())
+	supervisor, _ := newUnjournaled(MustCompile(validDefinition()), limits())
 	_ = supervisor.start(context.Background(), &testData{})
 	result := supervisor.issue(context.Background(), testStop, &testData{})
 	if !errors.Is(result.Err, ErrUnknownEvent) || errors.Is(result.Err, ErrNotPermitted) || result.Attempt != 0 ||
@@ -212,7 +212,7 @@ func TestIssueFailureLatchesUntilSuccessfulRecovery(t *testing.T) {
 		},
 	}
 	machine := MustCompile(definition)
-	supervisor, _ := New(machine, limits())
+	supervisor, _ := newUnjournaled(machine, limits())
 	if result := supervisor.start(context.Background(), &testData{allow: true}); result.Err != nil {
 		t.Fatal(result.Err)
 	}
@@ -239,7 +239,7 @@ func TestIssueFailureLatchesUntilSuccessfulRecovery(t *testing.T) {
 
 func TestVerifyFailureIsUncertainAndDoesNotCommit(t *testing.T) {
 	machine := MustCompile(tracedDefinition())
-	supervisor, _ := New(machine, limits())
+	supervisor, _ := newUnjournaled(machine, limits())
 	data := &testData{}
 	_ = supervisor.start(context.Background(), data)
 	issued := supervisor.issue(context.Background(), testStart, data)
@@ -283,7 +283,7 @@ func TestCallbackPanicAndGoexitAreContained(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			definition := validDefinition()
 			test.configure(&definition)
-			supervisor, _ := New(MustCompile(definition), limits())
+			supervisor, _ := newUnjournaled(MustCompile(definition), limits())
 			_ = supervisor.start(context.Background(), &testData{})
 			result := supervisor.issue(context.Background(), testStart, &testData{})
 			if !result.Faulted || result.Uncertain != test.uncertain {
@@ -312,7 +312,7 @@ func TestOperationTimeoutLeavesLateCallbackUncommittedAndBlocksRecovery(t *testi
 		return nil
 	}
 	machine := MustCompile(definition)
-	supervisor, _ := New(machine, Limits{
+	supervisor, _ := newUnjournaled(machine, Limits{
 		OperationTimeout:    20 * time.Millisecond,
 		VerificationTimeout: time.Second,
 	})
@@ -348,7 +348,7 @@ func TestOperationTimeoutLeavesLateCallbackUncommittedAndBlocksRecovery(t *testi
 
 func TestVerificationTimeoutLatchesFault(t *testing.T) {
 	machine := MustCompile(validDefinition())
-	supervisor, _ := New(machine, Limits{
+	supervisor, _ := newUnjournaled(machine, Limits{
 		OperationTimeout:    time.Second,
 		VerificationTimeout: 20 * time.Millisecond,
 	})
@@ -376,7 +376,7 @@ func TestTripRacingVerifyPreventsCommitAndIsFirstCause(t *testing.T) {
 		<-block
 		return nil
 	}
-	supervisor, _ := New(MustCompile(definition), limits())
+	supervisor, _ := newUnjournaled(MustCompile(definition), limits())
 	_ = supervisor.start(context.Background(), &testData{})
 	issued := supervisor.issue(context.Background(), testStart, &testData{})
 	resultCh := make(chan Result[testState, testEvent], 1)
@@ -405,13 +405,13 @@ func TestTripRacingVerifyPreventsCommitAndIsFirstCause(t *testing.T) {
 
 func TestRestoreRequiresMatchingDefinitionAndStartupReconciliation(t *testing.T) {
 	machine := MustCompile(validDefinition())
-	if _, err := Restore(machine, Snapshot[testState, testEvent]{DefinitionID: "other", State: testIdle}, limits()); !errors.Is(err, ErrDefinitionMismatch) {
+	if _, err := restoreUnjournaled(machine, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: "other", State: testIdle}, limits()); !errors.Is(err, ErrDefinitionMismatch) {
 		t.Fatalf("definition mismatch = %v", err)
 	}
-	if _, err := Restore(machine, Snapshot[testState, testEvent]{DefinitionID: machine.ID(), ExecutionID: "execution", State: testOther}, limits()); !errors.Is(err, ErrUnknownState) {
+	if _, err := restoreUnjournaled(machine, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: machine.ID(), ExecutionID: "execution", State: testOther}, limits()); !errors.Is(err, ErrUnknownState) {
 		t.Fatalf("unknown state = %v", err)
 	}
-	supervisor, err := Restore(machine, Snapshot[testState, testEvent]{DefinitionID: machine.ID(), ExecutionID: "execution", State: testRunning, Revision: 9, Attempt: 7}, limits())
+	supervisor, err := restoreUnjournaled(machine, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: machine.ID(), ExecutionID: "execution", State: testRunning, Revision: 9, Attempt: 7}, limits())
 	if err != nil {
 		t.Fatal(err)
 	}

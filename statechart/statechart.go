@@ -595,7 +595,10 @@ func (i *Instance[S, E, T]) State() S {
 	return i.state
 }
 
-// Fire applies event to the active state.
+// Fire applies event to the active state and reports the committed active
+// state, so assigning the result is always correct: on success it is the
+// resolved Destination, and on refusal or any action error it is the
+// unchanged Source.
 //
 // It selects rows in declaration order at the active state, then repeats at
 // each ancestor until a Guard applies. If none applies, Fire returns a refusal
@@ -617,12 +620,15 @@ func (i *Instance[S, E, T]) State() S {
 // Actions, which decide whether cancellation should decline or fail the event.
 // Attached observers receive a committed exit/entry batch after entry actions
 // succeed. Observer panic and runtime.Goexit failures retain their stacks and
-// are returned as errors matching statemachine.ErrObserverFailed after commit.
-func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
+// are returned as errors matching statemachine.ErrObserverFailed after commit;
+// the returned state is still the committed Destination in that case, and the
+// error must not be read as a failed transition.
+func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error) {
 	i.mu.Lock()
 	if i.inFlight {
+		state := i.state
 		i.mu.Unlock()
-		return ErrInFlight
+		return state, ErrInFlight
 	}
 	i.inFlight = true
 	source := i.state
@@ -636,7 +642,7 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
 
 	selection, reasons, ok := i.chart.selectTransition(ctx, source, event, data)
 	if !ok {
-		return &refusal[S, E]{source, event, append([]error{ErrNotPermitted}, reasons...)}
+		return source, &refusal[S, E]{source, event, append([]error{ErrNotPermitted}, reasons...)}
 	}
 	transition := selection.transition
 	info := selection.info
@@ -644,9 +650,9 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
 
 	if transition.Kind == Internal {
 		if err := runAction(ctx, transition.Do, info, data); err != nil {
-			return &ActionError{Phase: PhaseEffect, Err: err}
+			return source, &ActionError{Phase: PhaseEffect, Err: err}
 		}
-		return nil
+		return source, nil
 	}
 
 	var exits, entries []S
@@ -659,7 +665,7 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
 	for _, state := range exits {
 		for index, action := range i.chart.states[state].exit {
 			if err := runAction(ctx, action, info, data); err != nil {
-				return &ActionError{
+				return source, &ActionError{
 					Phase: PhaseExit, State: state, ActionIndex: index,
 					Completed: completedExits, Err: err,
 				}
@@ -668,14 +674,14 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
 		}
 	}
 	if err := runAction(ctx, transition.Do, info, data); err != nil {
-		return &ActionError{Phase: PhaseEffect, Err: err}
+		return source, &ActionError{Phase: PhaseEffect, Err: err}
 	}
 
 	completedEntries := 0
 	for _, state := range entries {
 		for index, action := range i.chart.states[state].entry {
 			if err := runAction(ctx, action, info, data); err != nil {
-				return &ActionError{
+				return source, &ActionError{
 					Phase: PhaseEntry, State: state, ActionIndex: index,
 					Completed: completedEntries, Err: err,
 				}
@@ -696,9 +702,9 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) error {
 	}
 	i.mu.Unlock()
 	if len(observers) != 0 {
-		return deliverTransitionObservations(observers, ctx, step, exits, entries, event, info, data)
+		return destination, deliverTransitionObservations(observers, ctx, step, exits, entries, event, info, data)
 	}
-	return nil
+	return destination, nil
 }
 
 func runAction[S, E comparable, T any](ctx context.Context, action Action[S, E, T], info Info[S, E], data T) error {

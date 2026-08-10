@@ -53,6 +53,11 @@ var (
 // state step returns only when step succeeds. It must not retry step.
 // Fire and Step detect repeated callbacks and successful returns without a
 // callback, report [ErrStoreContract], and never execute a repeated step.
+// Detection covers calls made before Update returns, including calls from
+// other goroutines that Update joins. A Store that violates the contract by
+// invoking step again after Update has already returned races with the
+// caller's use of the result; no detection window can cover that, so such a
+// Store is simply broken.
 // Implementations that can race with another process must use a conditional
 // write and report an error matching [ErrConflict] when it loses. If step
 // panics, the Store must abort its unit of work and propagate the panic.

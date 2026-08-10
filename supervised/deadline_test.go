@@ -80,7 +80,7 @@ func TestVerifyEnforcesStoredDeadlineAtAdmission(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			clock := newFakeClock()
-			supervisor, err := NewWithClock(MustCompile(validDefinition()), Limits{
+			supervisor, err := newUnjournaledWithClock(MustCompile(validDefinition()), Limits{
 				OperationTimeout: time.Minute, VerificationTimeout: 10 * time.Second,
 			}, clock)
 			if err != nil {
@@ -112,7 +112,7 @@ func TestVerifyEnforcesStoredDeadlineAtAdmission(t *testing.T) {
 func TestVerifyDeadlineAdmissionWinsRegardlessOfTimerMutexRace(t *testing.T) {
 	for range 100 {
 		clock := newFakeClock()
-		supervisor, err := NewWithClock(MustCompile(validDefinition()), Limits{
+		supervisor, err := newUnjournaledWithClock(MustCompile(validDefinition()), Limits{
 			OperationTimeout: time.Minute, VerificationTimeout: 10 * time.Second,
 		}, clock)
 		if err != nil {
@@ -154,7 +154,7 @@ func TestOperationTimeoutUsesInjectedClock(t *testing.T) {
 		<-ctx.Done()
 		return nil
 	}
-	supervisor, err := NewWithClock(MustCompile(definition), Limits{
+	supervisor, err := newUnjournaledWithClock(MustCompile(definition), Limits{
 		OperationTimeout: 10 * time.Second, VerificationTimeout: time.Minute,
 	}, clock)
 	if err != nil {
@@ -183,7 +183,7 @@ func (c *expiringContext) Done() <-chan struct{} { return c.done }
 func (c *expiringContext) Err() error            { return c.err }
 
 func TestInvokePreservesCompletedCallbackErrorAtDeadline(t *testing.T) {
-	supervisor, _ := New(MustCompile(validDefinition()), limits())
+	supervisor, _ := newUnjournaled(MustCompile(validDefinition()), limits())
 	supervisor.mu.Lock()
 	change := supervisor.currentChangeLocked()
 	ctx := &expiringContext{Context: context.Background(), done: make(chan struct{})}
@@ -221,7 +221,7 @@ func TestPostVerifyMandatoryFailuresLatchWithoutCommit(t *testing.T) {
 					return sentinel
 				}}
 			}
-			supervisor, _ := New(MustCompile(definition), limits())
+			supervisor, _ := newUnjournaled(MustCompile(definition), limits())
 			_ = supervisor.start(context.Background(), &testData{})
 			issued := supervisor.issue(context.Background(), testStart, &testData{})
 			result := supervisor.verify(context.Background(), issued.AttemptKey, &testData{})

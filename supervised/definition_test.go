@@ -133,7 +133,7 @@ func TestCompileCopiesDefinitionSlices(t *testing.T) {
 			t.Fatalf("Transition ID = %q", transition.ID)
 		}
 	}
-	supervisor, err := New(machine, Limits{OperationTimeout: 1, VerificationTimeout: 1})
+	supervisor, err := newUnjournaled(machine, Limits{OperationTimeout: 1, VerificationTimeout: 1})
 	if err != nil || supervisor == nil {
 		t.Fatalf("New = %v, %v", supervisor, err)
 	}

@@ -57,15 +57,15 @@ func Example() {
 	fmt.Println("initial:", run.State())
 
 	command := &Command{}
-	_ = run.Fire(context.Background(), Answer, command)
+	_, _ = run.Fire(context.Background(), Answer, command)
 	fmt.Println("answer:", run.State(), command.Trace)
 
 	command.Trace = nil
-	_ = run.Fire(context.Background(), Restart, command) // inherited from Call
+	_, _ = run.Fire(context.Background(), Restart, command) // inherited from Call
 	fmt.Println("restart:", run.State(), command.Trace)
 
 	command.Trace = nil
-	_ = run.Fire(context.Background(), Hangup, command) // inherited from Call
+	_, _ = run.Fire(context.Background(), Hangup, command) // inherited from Call
 	fmt.Println("hangup:", run.State(), command.Trace)
 
 	// Output:
@@ -146,7 +146,7 @@ func ExampleObserver_census() {
 	}
 
 	run, _ := chart.NewWithObservers(Ringing, observer)
-	_ = run.Fire(context.Background(), Hangup, &Command{ID: "A1"})
+	_, _ = run.Fire(context.Background(), Hangup, &Command{ID: "A1"})
 	fmt.Println("census:", counts[Call], counts[Ringing], counts[Idle])
 
 	// Output:
