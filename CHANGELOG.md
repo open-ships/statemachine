@@ -29,4 +29,4 @@ previously drafted 2.0.0 was never tagged and its changes land here.
 - Detect Store callback contract violations and unsafe generic map keys.
 - Timestamp committed Observations and return contained Observer failures after commit with their original stacks.
 - Add supervisor model fuzzing, logical/external benchmarks, static analysis, coverage retention, and requirements traceability.
-- Replace automatic patch releases with signed, annotated, human-gated releases and retained assurance artifacts.
+- Publish successful current-main builds automatically as annotated releases with retained assurance artifacts, using `VERSION` as the next baseline and incrementing patch versions thereafter.
