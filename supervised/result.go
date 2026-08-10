@@ -50,6 +50,13 @@ var (
 	ErrCounterExhausted = errors.New("supervised: counter exhausted")
 	// ErrInvalidSnapshot reports missing durable execution identity.
 	ErrInvalidSnapshot = errors.New("supervised: snapshot has no execution identity")
+	// ErrSnapshotVersion reports a Snapshot whose schema version this module
+	// does not understand. Migrate the stored Snapshot before restoring.
+	ErrSnapshotVersion = errors.New("supervised: unsupported snapshot version")
+	// ErrInvalidDecision reports an Adjudicate call whose Decision is not
+	// applicable to the latched Fault: an unknown Outcome, adoption without an
+	// in-doubt external Change, or an override to an undeclared state.
+	ErrInvalidDecision = errors.New("supervised: adjudication decision is not applicable")
 	// ErrRestoredInDoubt reports a restored Snapshot whose prior execution may
 	// have issued physical work or retained a Fault.
 	ErrRestoredInDoubt = errors.New("supervised: restored execution requires reconciliation")
@@ -84,6 +91,7 @@ const (
 	PhaseCommit
 	PhaseRecover
 	PhaseTrip
+	PhaseAdjudicate
 )
 
 func (p Phase) String() string {
@@ -112,6 +120,8 @@ func (p Phase) String() string {
 		return "recover"
 	case PhaseTrip:
 		return "trip"
+	case PhaseAdjudicate:
+		return "adjudicate"
 	default:
 		return fmt.Sprintf("Phase(%d)", uint8(p))
 	}
@@ -145,11 +155,22 @@ func (m Mode) String() string {
 	}
 }
 
-// Limits bounds one callback-bearing operation and the interval between Issue
-// and Verify. Both values must be positive.
+// DefaultMaxRecords is the in-process lifecycle Record retention used when
+// Limits.MaxRecords is zero.
+const DefaultMaxRecords = 1024
+
+// Limits bounds one callback-bearing operation, the interval between Issue and
+// Verify, and in-process lifecycle Record retention. Both timeouts must be
+// positive.
+//
+// MaxRecords bounds the Records history retained in memory: once full, the
+// oldest Record is dropped for each new one and Status.RecordsDropped counts
+// the loss. Zero means [DefaultMaxRecords]; a negative value is invalid.
+// Durable, unbounded history belongs to the Recorder seam, not this buffer.
 type Limits struct {
 	OperationTimeout    time.Duration
 	VerificationTimeout time.Duration
+	MaxRecords          int
 }
 
 // PendingSnapshot is the durable identity of external work that may have
@@ -166,16 +187,38 @@ type PendingSnapshot[S, E comparable] struct {
 	VerificationDeadline time.Time
 }
 
+// SnapshotVersion is the Snapshot schema version this module reads and
+// writes. Restore rejects any other value with [ErrSnapshotVersion], so a
+// fielded journal can be migrated explicitly instead of being reinterpreted
+// silently.
+const SnapshotVersion uint32 = 1
+
 // Snapshot is the durable execution state required to restore a Supervisor. It
 // carries non-reusable execution identity and typed in-doubt Change identity;
 // it contains no claim about external physical state. Start reconciles a clean
-// Snapshot, while an in-doubt or faulted restore requires Recover.
+// Snapshot, while an in-doubt or faulted restore requires Recover or
+// Adjudicate.
+//
+// Restarts counts prior restorations of this execution and Records is the
+// lifecycle Record sequence high-water mark when the Snapshot was taken.
+// Restore increments Restarts and resumes Record sequencing at Records, so
+// the durable Record identity (ExecutionID, Restarts, Seq) is never reused
+// across process incarnations.
+//
+// A Snapshot proves nothing about its own freshness: an attacker or a
+// misconfigured restore path can present a valid older Snapshot. Rollback
+// detection needs an external durable authority — compare Revision, Attempt,
+// and Restarts against independently stored high-water marks before trusting
+// a restored execution.
 type Snapshot[S, E comparable] struct {
+	Version      uint32
 	DefinitionID string
 	ExecutionID  string
+	Restarts     uint64
 	State        S
 	Revision     uint64
 	Attempt      uint64
+	Records      uint64
 	Pending      *PendingSnapshot[S, E]
 	InDoubt      bool
 	Faulted      bool
@@ -185,10 +228,50 @@ type Snapshot[S, E comparable] struct {
 	RecordedAt   time.Time
 }
 
-// Result describes one Start, Attempt, Verify, or Recover outcome. The public
-// operation also returns Err separately so tooling can detect discarded
-// failures. IssueCompleted false never proves that an external system did not
-// receive a partial command.
+// Adjudication selects the recovery outcome for a latched Fault. The zero
+// value is invalid so an accidental zero Decision can never adjudicate.
+type Adjudication uint8
+
+const (
+	// AdjudicateRetain keeps the last committed state. Recover is exactly
+	// this adjudication with no supporting evidence text.
+	AdjudicateRetain Adjudication = iota + 1
+	// AdjudicateAdopt commits the Destination of the in-doubt external
+	// Change, on application evidence that the controller completed it.
+	AdjudicateAdopt
+	// AdjudicateOverride commits an explicitly selected declared state, such
+	// as a minimum-risk condition established outside this execution.
+	AdjudicateOverride
+)
+
+func (a Adjudication) String() string {
+	switch a {
+	case AdjudicateRetain:
+		return "retain"
+	case AdjudicateAdopt:
+		return "adopt"
+	case AdjudicateOverride:
+		return "override"
+	default:
+		return fmt.Sprintf("Adjudication(%d)", uint8(a))
+	}
+}
+
+// Decision is one explicit, auditable reconciliation outcome presented to
+// [Supervisor.Adjudicate]. State is read only for AdjudicateOverride.
+// Evidence is retained verbatim in the resulting lifecycle Record; it should
+// identify the application facts — controller acknowledgements, operator
+// authority, sensor readings — that justify the outcome.
+type Decision[S comparable] struct {
+	Outcome  Adjudication
+	State    S
+	Evidence string
+}
+
+// Result describes one Start, Attempt, Verify, Recover, or Adjudicate
+// outcome. The public operation also returns Err separately so tooling can
+// detect discarded failures. IssueCompleted false never proves that an
+// external system did not receive a partial command.
 type Result[S, E comparable] struct {
 	DefinitionID   string
 	ExecutionID    string
@@ -207,9 +290,16 @@ type Result[S, E comparable] struct {
 	Committed      bool
 	Faulted        bool
 	Uncertain      bool
-	StartedAt      time.Time
-	CompletedAt    time.Time
-	Err            error
+	// Evidence echoes the Decision text of an Adjudicate outcome.
+	Evidence    string
+	StartedAt   time.Time
+	CompletedAt time.Time
+	Err         error
+
+	// stamp is the causal record identity assigned under the Supervisor lock
+	// at the instant this outcome was decided. It is transport for the
+	// lifecycle Record, never part of the public outcome.
+	stamp recordStamp
 }
 
 // Fault is an outward snapshot of the immutable first cause retained privately

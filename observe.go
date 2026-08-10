@@ -12,6 +12,10 @@ import (
 // ErrObserverFailed reports a contained Observer panic or runtime.Goexit.
 var ErrObserverFailed = errors.New("statemachine: observer failed after commit")
 
+// ErrObserverTimeout reports that a delivery wrapped by [TimeoutObserver]
+// exceeded its bound. The observer goroutine may still be running.
+var ErrObserverTimeout = errors.New("statemachine: observer delivery timed out")
+
 // ObserverError preserves one contained Observer failure and its original
 // stack. The observed state change remains committed.
 type ObserverError struct {
@@ -32,7 +36,19 @@ func (e *ObserverError) Error() string {
 	return fmt.Sprintf("%v: observer %d panicked at observation %d: %v", ErrObserverFailed, e.Observer, e.Seq, e.Value)
 }
 
-func (e *ObserverError) Unwrap() error { return ErrObserverFailed }
+// Unwrap makes every ObserverError match ErrObserverFailed and, when the
+// contained panic value is itself an error — as it is for [TimeoutObserver]
+// timeouts and nested ObserverErrors — that error too, so errors.Is can reach
+// [ErrObserverTimeout] through the containment layers.
+func (e *ObserverError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	if cause, ok := e.Value.(error); ok {
+		return []error{ErrObserverFailed, cause}
+	}
+	return []error{ErrObserverFailed}
+}
 
 // Move identifies one committed change in node membership.
 type Move uint8
@@ -65,6 +81,12 @@ func (m Move) String() string {
 // time at which the committed Step was published; every Observation in one
 // Step has the same At value.
 //
+// At is wall-clock time and is subject to clock steps (NTP or GNSS
+// discipline): At ordering across a step is not trustworthy, and Seq is the
+// authoritative order within one execution. Seq restarts at one for each
+// reconstructed execution and carries no execution identity; a census across
+// restarts must seed and correlate independently.
+//
 // Observation deliberately contains neither context.Context nor T. Both are
 // supplied to Observer without type erasure. An Observation is comparable when
 // S and E are comparable.
@@ -95,6 +117,12 @@ type Observer[S, E comparable, T any] func(context.Context, Observation[S, E], T
 // Observers combines observers in argument order. Nil observers are ignored.
 // Each observer is isolated, so a panic or runtime.Goexit in one does not stop
 // later observers.
+//
+// The combined Observer reports the joined inner failures by panicking, which
+// the delivery boundary of this module contains and returns as an error
+// matching [ErrObserverFailed]. Application code that invokes the combined
+// Observer directly, outside an Instance or Runtime, must be prepared to
+// recover that panic itself.
 func Observers[S, E comparable, T any](observers ...Observer[S, E, T]) Observer[S, E, T] {
 	observers = copyObservers(observers)
 	if len(observers) == 0 {
@@ -110,6 +138,76 @@ func Observers[S, E comparable, T any](observers ...Observer[S, E, T]) Observer[
 		if len(failures) != 0 {
 			panic(errors.Join(failures...))
 		}
+	}
+}
+
+// TimeoutObserver bounds one observer's synchronous delivery. The wrapped
+// observer runs in its own goroutine; if it has not returned after timeout,
+// delivery fails with an error matching [ErrObserverTimeout] and
+// [ErrObserverFailed] while the committed state change stands. Panics and
+// runtime.Goexit inside the wrapped observer keep their original stacks.
+//
+// A timed-out observer goroutine is abandoned, not terminated: it may still be
+// running, and an observer that blocks permanently leaks one goroutine per
+// timed-out delivery. The bound therefore protects the execution's liveness,
+// not the process's total resources; an observer that can block — a network
+// logger, a slow sink — should also carry its own internal deadline.
+//
+// timeout must be positive; TimeoutObserver panics otherwise, because an
+// unbounded bound is a construction defect, not a runtime condition. A nil
+// observer returns nil, which deliveries ignore.
+func TimeoutObserver[S, E comparable, T any](
+	observer Observer[S, E, T],
+	timeout time.Duration,
+) Observer[S, E, T] {
+	if timeout <= 0 {
+		panic("statemachine: TimeoutObserver requires a positive timeout")
+	}
+	if observer == nil {
+		return nil
+	}
+	return func(ctx context.Context, observation Observation[S, E], data T) {
+		done := internalobserver.Start(func() { observer(ctx, observation, data) })
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case failure := <-done:
+			if failure != nil {
+				panic(&ObserverError{
+					Seq: observation.Seq, Value: failure.Value,
+					Stack: failure.Stack, Stopped: failure.Stopped,
+				})
+			}
+		case <-timer.C:
+			panic(fmt.Errorf("%w after %v", ErrObserverTimeout, timeout))
+		}
+	}
+}
+
+// ContainedObserver separates observation health from the transition error
+// channel. Failures of the wrapped observer — panic, runtime.Goexit, or a
+// [TimeoutObserver] timeout — never join the error returned by Fire: they are
+// passed to report as an error matching [ErrObserverFailed], on the delivering
+// goroutine, and the delivery is treated as successful.
+//
+// This is the seam for callers that must preserve the invariant that a non-nil
+// Fire error implies the transition did not commit. A nil report drops
+// failures. A panic or runtime.Goexit in report itself is contained and
+// dropped: the reporting seam must never become a new failure channel. A nil
+// observer returns nil, which deliveries ignore.
+func ContainedObserver[S, E comparable, T any](
+	observer Observer[S, E, T],
+	report func(error),
+) Observer[S, E, T] {
+	if observer == nil {
+		return nil
+	}
+	return func(ctx context.Context, observation Observation[S, E], data T) {
+		err := callObserver(0, observer, ctx, observation, data)
+		if err == nil || report == nil {
+			return
+		}
+		_ = internalobserver.Call(func() { report(err) })
 	}
 }
 

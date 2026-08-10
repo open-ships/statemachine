@@ -14,7 +14,7 @@ type mutableTestError struct{ message string }
 func (e *mutableTestError) Error() string { return e.message }
 
 func TestPublicOperationsReturnToolVisibleErrors(t *testing.T) {
-	supervisor, _ := New(MustCompile(validDefinition()), limits())
+	supervisor, _ := newUnjournaled(MustCompile(validDefinition()), limits())
 	if result, err := supervisor.Issue(context.Background(), testStart, &testData{}); !errors.Is(err, ErrNotStarted) || result.Err != err {
 		t.Fatalf("Issue = %+v, %v", result, err)
 	}
@@ -29,7 +29,7 @@ func TestFaultResultsNeverExposeSupervisorStorage(t *testing.T) {
 	definition.Transitions[0].Issue = func(context.Context, Change[testState, testEvent], *testData) error {
 		return cause
 	}
-	supervisor, _ := New(MustCompile(definition), limits())
+	supervisor, _ := newUnjournaled(MustCompile(definition), limits())
 	_ = supervisor.start(context.Background(), &testData{})
 	result := supervisor.issue(context.Background(), testStart, &testData{})
 	var outward *Fault[testState, testEvent]
@@ -59,7 +59,7 @@ func TestFaultResultsNeverExposeSupervisorStorage(t *testing.T) {
 
 func TestSupervisorOwnsCompiledMachineValue(t *testing.T) {
 	original := MustCompile(validDefinition())
-	supervisor, _ := New(original, limits())
+	supervisor, _ := newUnjournaled(original, limits())
 	replacementDefinition := validDefinition()
 	replacementDefinition.ID = "replacement/v1"
 	replacementDefinition.Transitions[0].ID = "replacement-transition"
@@ -80,7 +80,7 @@ func TestSupervisorOwnsCompiledMachineValue(t *testing.T) {
 
 func TestRestorePreservesAttemptHighWaterAndInDoubtState(t *testing.T) {
 	machine := MustCompile(validDefinition())
-	original, _ := New(machine, limits())
+	original, _ := newUnjournaled(machine, limits())
 	_ = original.start(context.Background(), &testData{})
 	issued := original.issue(context.Background(), testStart, &testData{})
 	snapshot := original.Snapshot()
@@ -91,7 +91,7 @@ func TestRestorePreservesAttemptHighWaterAndInDoubtState(t *testing.T) {
 	}
 	_ = original.Trip(errTrip)
 
-	restored, err := Restore(machine, snapshot, limits())
+	restored, err := restoreUnjournaled(machine, snapshot, limits())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestRecoverWaitsForWholeRevokedOperation(t *testing.T) {
 		<-release
 		return nil
 	}
-	supervisor, _ := New(MustCompile(definition), limits())
+	supervisor, _ := newUnjournaled(MustCompile(definition), limits())
 	_ = supervisor.start(context.Background(), &testData{})
 	done := make(chan Result[testState, testEvent], 1)
 	go func() { done <- supervisor.issue(context.Background(), testStart, &testData{}) }()
@@ -149,7 +149,7 @@ func TestCallerDeadlineIsNotSupervisorOperationTimeout(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	supervisor, _ := New(MustCompile(definition), Limits{
+	supervisor, _ := newUnjournaled(MustCompile(definition), Limits{
 		OperationTimeout: time.Second, VerificationTimeout: time.Second,
 	})
 	_ = supervisor.start(context.Background(), &testData{})
@@ -165,8 +165,9 @@ func TestLifecycleRecorderPublishesAsynchronousExpiryAndFailures(t *testing.T) {
 	clock := newFakeClock()
 	var delivered []Record[testState, testEvent]
 	supervisor, err := NewWithOptions(MustCompile(validDefinition()), Options[testState, testEvent]{
-		Limits: Limits{OperationTimeout: time.Minute, VerificationTimeout: 10 * time.Second},
-		Clock:  clock,
+		Limits:      Limits{OperationTimeout: time.Minute, VerificationTimeout: 10 * time.Second},
+		Clock:       clock,
+		Unjournaled: true,
 		Recorder: func(_ context.Context, record Record[testState, testEvent]) error {
 			delivered = append(delivered, record)
 			if record.Kind == RecordIssue {
@@ -284,7 +285,7 @@ func TestRecorderPanicAndGoexitAreVisibleWithoutChangingOutcome(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			supervisor, err := NewWithOptions(MustCompile(validDefinition()), Options[testState, testEvent]{
-				Limits: limits(), Recorder: test.recorder,
+				Limits: limits(), Recorder: test.recorder, Unjournaled: true,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -299,16 +300,18 @@ func TestRecorderPanicAndGoexitAreVisibleWithoutChangingOutcome(t *testing.T) {
 
 func TestRestoreClockAndOptionsSeams(t *testing.T) {
 	machine := MustCompile(validDefinition())
-	original, _ := New(machine, limits())
+	original, _ := newUnjournaled(machine, limits())
 	snapshot := original.Snapshot()
 	clock := newFakeClock()
-	withClock, err := RestoreWithClock(machine, snapshot, limits(), clock)
+	withClock, err := RestoreWithOptions(machine, snapshot, Options[testState, testEvent]{
+		Limits: limits(), Clock: clock, Unjournaled: true,
+	})
 	if err != nil || withClock.Snapshot().RecordedAt != clock.Now() {
-		t.Fatalf("RestoreWithClock = %v, %+v", err, withClock)
+		t.Fatalf("restore with clock = %v, %+v", err, withClock)
 	}
 	var records []Record[testState, testEvent]
 	withOptions, err := RestoreWithOptions(machine, snapshot, Options[testState, testEvent]{
-		Limits: limits(), Clock: clock,
+		Limits: limits(), Clock: clock, Unjournaled: true,
 		Recorder: func(_ context.Context, record Record[testState, testEvent]) error {
 			records = append(records, record)
 			return nil

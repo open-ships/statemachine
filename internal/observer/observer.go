@@ -15,6 +15,13 @@ type Failure struct {
 // Call invokes callback in an isolated goroutine. It returns nil only when the
 // callback returns normally.
 func Call(callback func()) *Failure {
+	return <-Start(callback)
+}
+
+// Start invokes callback in an isolated goroutine and returns the channel its
+// outcome will be delivered on, so a caller can bound its wait. The channel is
+// buffered: an abandoned callback still completes and never blocks sending.
+func Start(callback func()) <-chan *Failure {
 	done := make(chan *Failure, 1)
 	go func() {
 		returned := false
@@ -34,5 +41,5 @@ func Call(callback func()) *Failure {
 		callback()
 		returned = true
 	}()
-	return <-done
+	return done
 }
