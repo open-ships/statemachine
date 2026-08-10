@@ -12,4 +12,4 @@
 - Function values and mutable closure captures remain shared by compiled definitions. Callers must synchronize or avoid mutable captures.
 - State, event, Snapshot, Record, and Observation values are shallow, and a retained Fault cause is an application-owned error value. Use immutable value types, immutable error values, and immutable evidence snapshots.
 - Verification evidence is untyped: the module cannot validate sensor identity, evidence age, calibration, coherence, or operator authority. A CE-oriented integration profile must enforce typed evidence before any Check runs (INT-EVID-001).
-- Existing historical tags through v1.2.1 are lightweight and unsigned. They are not rewritten; 1.3.0 and later use the signed, human-gated release process.
+- Existing historical tags through v1.2.1 are lightweight. They are not rewritten; 1.3.0 and later are annotated automatically by GitHub Actions, but are not cryptographically signed.
