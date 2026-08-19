@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Replace the caller-owned, effectful `Machine.Fire` interface with pure
+  `Machine.Next`. `Next` runs Guards and selects a destination but cannot run
+  `Do`; transition effects now execute only through `Instance`, queued Runtime,
+  or Store-backed state owners. This is a breaking interface change that removes
+  the lost-transition hazard where an effect ran but its returned state was
+  discarded.
+
 ## 1.3.0
 
 This release is the API. The project is pre-adoption, so it stays in v1

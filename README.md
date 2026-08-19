@@ -13,13 +13,16 @@ import "github.com/open-ships/statemachine"
 A finite state machine is a partial function from `(state, event)` to `state`. This package keeps
 that function as its core and builds optional state owners around it.
 
-**A `Machine` does not hold the current state.** It is an immutable compiled definition. State can
-remain a value you own — a struct field, a database column — and a step is the application of the
-definition to that value:
+**A `Machine` does not hold the current state.** It is an immutable compiled definition. `Next`
+answers a pure question about a value you own and never runs the selected row's effect:
 
 ```go
-order.State, err = orders.Fire(ctx, order.State, Pay, cmd)
+next, err := orders.Next(ctx, order.State, Submit, cmd)
 ```
+
+Use `Next` for planning or a row with no `Do`. To perform an effectful row, use
+an `Instance`, queued Runtime, or Store-backed execution; assigning the `Next`
+result would intentionally skip its effect.
 
 One definition can serve a million aggregates and any number of goroutines. When the package should
 own execution state instead, construct one `Instance` per aggregate. The [`queued`](queued) package
@@ -49,7 +52,7 @@ var light = statemachine.MustCompile([]statemachine.Transition[State, Event, str
 
 func main() {
 	s := Off
-	s, _ = light.Fire(context.Background(), s, Flip, struct{}{})
+	s, _ = light.Next(context.Background(), s, Flip, struct{}{})
 	fmt.Println(s) // on
 }
 ```
@@ -83,7 +86,7 @@ failure — it drops that row and tries the next one, so a trailing unguarded ro
 semantics of a `switch`. Only when no row is left does the reason reach the caller:
 
 ```go
-_, err := orders.Fire(ctx, Delivered, Refund, cmd)
+_, err := orders.Next(ctx, Delivered, Refund, cmd)
 
 errors.Is(err, statemachine.ErrNotPermitted) // true: the machine refused    -> 409
 errors.Is(err, ErrWindowClosed)              // true: and this is why        -> 422
@@ -91,9 +94,9 @@ errors.Is(err, ErrWindowClosed)              // true: and this is why        -> 
 
 That is the whole 409-versus-422 story, with no second error type and no `errors.As`.
 
-**Effects fail with `return err`.** `Fire` reports the destination if and only if `Do` returned `nil`,
-and the error comes back to you unwrapped, so `errors.Is` against your own sentinels works with no
-ceremony:
+**Effects run only behind a state owner.** `Machine.Next` never calls `Do`. `Instance.Fire`, a queued
+runtime, or Store-backed execution runs the selected effect and publishes the destination only when
+`Do` returns `nil`. The error comes back unwrapped:
 
 ```go
 {From: Pending, Event: Pay, To: Paid, Do: func(ctx context.Context, c *Cmd) error {
@@ -101,7 +104,7 @@ ceremony:
 }},
 ```
 
-**Affordances come from the same rule as firing**, so a rendered button and the handler that receives
+**Affordances come from the same selection rule as execution**, so a rendered button and the handler that receives
 its click cannot disagree about where an event leads:
 
 ```go
@@ -118,7 +121,7 @@ for event, to := range orders.Permitted(ctx, o.State, cmd) {
 | `Machine[S, E comparable, T any]` | a compiled table; immutable, safe for concurrent use |
 | `Compile(transitions)` | build a machine, reporting an unreachable row |
 | `MustCompile(transitions)` | the same, panicking — for tables that are program text |
-| `Machine.Fire(ctx, from, event, data)` | apply an event; report the state to move to |
+| `Machine.Next(ctx, from, event, data)` | select and report a destination without running `Do` |
 | `Machine.Permitted(ctx, from, data)` | iterate the events accepted now, each with its destination |
 | `ErrNotPermitted` | the sentinel every refusal wraps |
 
@@ -144,8 +147,9 @@ observation-silent. A shared observer can be called concurrently by different
 executions and must synchronize its own census or sink.
 
 `T` is the value handed to every `Guard` and `Do` — your aggregate, plus whatever this command needs.
-It is passed to `Fire` rather than stored, so one immutable `Machine` serves every request while
-still seeing request-scoped values. A machine with nothing to carry uses `struct{}`.
+It is passed to `Next` or the state-owning execution rather than stored, so one immutable `Machine`
+serves every request while still seeing request-scoped values. A machine with nothing to carry uses
+`struct{}`.
 
 Visualization and reachability checking remain ordinary loops over the flat table. Per-state entry
 and exit actions do not belong to a flat `Machine`; use the `statechart` package when those semantics
@@ -155,7 +159,7 @@ are required. Runnable flat-machine examples are in [`example_test.go`](example_
 
 | Need | Module | State and concurrency semantics |
 |---|---|---|
-| Database aggregate or explicit assignment | `Machine` | caller-owned |
+| Pure planning or explicit assignment with no effects | `Machine.Next` | caller-owned value; never runs `Do` |
 | One in-memory aggregate | `Instance` | owned state; overlapping fire fails fast |
 | Follow-up events and FIFO serialization | `queued.Runtime` | owned state; each root run drains to completion |
 | Database state and outbox work | `persist.Fire` | transactional when the Store supplies a transaction; never auto-retried |
@@ -190,9 +194,10 @@ relationships.
 
 ## Hazards
 
-**Discarding `Machine.Fire`'s returned state is never correct.** The effect has already run, and
-neither the compiler nor `go vet` reports the lost transition. A state-owning `Instance.Fire` may
-discard its returned state, but its error still must be handled.
+**`Machine.Next` never runs `Do`.** Effectful execution is available only through a state owner, so
+discarding a pure query cannot leave an external effect behind. A state-owning `Instance.Fire` may
+discard its returned state because the Instance has already committed it, but its error still must
+be handled.
 
 An `Instance` or queued runtime is the sole owner of its state. Do not also keep an authoritative
 copy in the value passed as `T`. Effects can still be partial: the state owner guarantees its state
@@ -217,16 +222,16 @@ documented in full on
 ## Performance
 
 Apple M1 Pro, Go 1.26, measured with `testing.B.Loop`. Nothing on the flat `Machine`'s successful
-path allocates: `Fire` is a map lookup, a guard call and a return, and `Permitted`'s lazy iterator
+path allocates: `Next` is a map lookup, a guard call and a return, and `Permitted`'s lazy iterator
 stays on the stack. A refusal allocates only the error. The state-owning modules intentionally add
 synchronization and, where required, eager snapshots or queued work.
 
 ```
-BenchmarkFireAccepted-10      60591013    21.32 ns/op     0 B/op    0 allocs/op
-BenchmarkFireDefaultArm-10    45832159    25.39 ns/op     0 B/op    0 allocs/op
-BenchmarkFireRefused-10       11011408   113.90 ns/op    80 B/op    2 allocs/op
-BenchmarkRefusalErrorsIs-10  117287949    10.30 ns/op     0 B/op    0 allocs/op
-BenchmarkPermitted-10         26448175    47.00 ns/op     0 B/op    0 allocs/op
+BenchmarkNextAccepted-10      44001490    27.18 ns/op     0 B/op    0 allocs/op
+BenchmarkNextDefaultArm-10    61790773    19.42 ns/op     0 B/op    0 allocs/op
+BenchmarkNextRefused-10       25778685    46.09 ns/op    80 B/op    2 allocs/op
+BenchmarkRefusalErrorsIs-10  132888273     9.03 ns/op     0 B/op    0 allocs/op
+BenchmarkPermitted-10         30415488    39.53 ns/op     0 B/op    0 allocs/op
 ```
 
 Go 1.26 is what makes `Permitted` free: the `iter.Seq2` it returns closes over the machine, the state

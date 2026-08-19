@@ -1,20 +1,18 @@
-// Package statemachine compiles finite state-machine definitions and runs them
-// with caller-owned or package-owned state.
+// Package statemachine compiles finite state-machine definitions and executes
+// them through explicit state owners.
 //
 // A [Machine] is the flat transition function: an immutable table of
 // [Transition] rows, compiled once and safe for use by any number of
 // goroutines. It depends only on the standard library.
 //
-// A Machine does not hold the current state. State is a value the caller owns —
-// a field on a struct, a column in a row — and a step is the application of the
-// machine to that value:
+// A Machine does not hold the current state. [Machine.Next] is a pure
+// transition query for a caller-owned value: it runs Guards and reports the
+// selected destination, but never runs the row's Do effect:
 //
-//	var err error
-//	order.State, err = orders.Fire(ctx, order.State, Pay, cmd)
+//	next, err := orders.Next(ctx, order.State, Submit, cmd)
 //
-// This form is useful for database rows and explicit read-modify-write flows:
-// restoring an aggregate means passing the loaded state to Fire, and one
-// Machine can serve millions of aggregates without creating runtime objects.
+// One Machine can serve millions of aggregates and pure planning queries. To
+// run effects, choose the module that owns the resulting state.
 //
 // When the package should own one in-memory aggregate's current state, use an
 // [Instance]:
@@ -29,9 +27,9 @@
 // unrestricted state setter.
 //
 // State ownership does not change definition semantics. This package remains
-// a flat machine with row effects. The queued subpackage adds serialized
-// run-to-completion cascades, persist places Machine.Fire inside an
-// adapter-owned unit of work, and statechart supplies hierarchy, initial
+// a flat machine with row effects, but only a state owner may run those effects.
+// The queued subpackage adds serialized run-to-completion cascades, persist
+// executes through an adapter-owned unit of work, and statechart supplies hierarchy, initial
 // substates, lifecycle actions, and explicit transition kinds. The supervised
 // subpackage supplies a separate strict definition with mandatory checks,
 // explicit issue and verification, finite time limits, startup reconciliation,
@@ -72,9 +70,9 @@
 //
 // The third type parameter is the value handed to every Guard and Do of that
 // machine — the aggregate being transitioned, plus whatever this particular
-// command needs. It is passed to [Machine.Fire] rather than stored, so one
-// immutable Machine serves every request while still seeing request-scoped
-// values. A machine with nothing to carry uses struct{}.
+// command needs. It is passed to [Machine.Next] or a state-owning execution
+// rather than stored, so one immutable Machine serves every request while still
+// seeing request-scoped values. A machine with nothing to carry uses struct{}.
 //
 // Two rows may share a From and an Event. The first whose Guard applies wins, so
 // a trailing unguarded row is a default arm — the semantics of a switch, of
@@ -83,26 +81,11 @@
 //
 // # Observing transitions
 //
-// A Machine has no observer or per-state hooks. Fire returns the new state and
-// the caller already holds the old state and the event, so every transition is
-// visible on the line that performs it. Write the wrapper once per machine and
-// put the logging, the metrics and the write there:
-//
-//	func (s *Service) fire(ctx context.Context, o *Order, e Event, c *Cmd) error {
-//		from := o.State
-//		next, err := orders.Fire(ctx, from, e, c)
-//		o.State = next
-//		s.log.InfoContext(ctx, "transition",
-//			"id", o.ID, "from", from, "event", e, "to", next, "err", err)
-//		return err
-//	}
-//
-// Assigning the returned state is always correct: Fire reports the state it was
-// given whenever it reports an error.
-//
-// State-owning executions are different: reading State before Fire is a second,
-// racy operation, and a queued Runtime may commit several follow-up transitions
-// before Fire returns. [NewInstanceWithObservers], queued.NewWithObservers and
+// A Machine has no observer or per-state hooks because Next selects without
+// committing anything. State-owning executions can publish committed changes.
+// Reading State before Fire is a second, racy operation, and a queued Runtime
+// may commit several follow-up transitions before Fire returns.
+// [NewInstanceWithObservers], queued.NewWithObservers and
 // statechart.Chart.NewWithObservers attach immutable observers at the ownership
 // seam. They emit an [Observation] for every committed node exit and entry. A
 // flat self-transition changes no position and emits nothing.
@@ -132,9 +115,11 @@
 //
 // # Hazards
 //
-//   - Discarding [Machine.Fire]'s returned state is never correct. The effect
-//     has already run. [Instance.Fire] owns and publishes its state, so callers
-//     may discard that state result but must still handle its error.
+//   - [Machine.Next] never runs Do. Effects are available only through a
+//     state-owning execution, so discarding a pure query cannot leave an effect
+//     behind. Do not use Next to commit an effectful row: that would skip Do.
+//     [Instance.Fire] owns and publishes its state, so callers may discard that
+//     state result but must still handle its error.
 //   - An Instance is the sole authority for its state. Do not retain another
 //     authoritative state field in T; it can diverge on errors and panics.
 //   - Instance rejects overlap and same-instance recursive firing. Use the
@@ -150,8 +135,7 @@
 //   - A Guard must be pure. It is called for rows that lose, and by Permitted.
 //   - A Guard vetoes only if no other row for that From and Event applies.
 //   - [ErrNotPermitted] is a sentinel and travels like one. A Guard or Do that
-//     fires another machine must not return its refusal, wrapped or otherwise.
+//     runs another execution must not return its refusal, wrapped or otherwise.
 //   - Guards and effects see data, which the caller also owns. Recursively
-//     calling Machine.Fire for the same caller-owned state loses the nested
-//     transition; Instance reports ErrInFlight instead.
+//     calling [Instance.Fire] on the same execution reports ErrInFlight.
 package statemachine

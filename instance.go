@@ -114,7 +114,7 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error
 		i.mu.Unlock()
 	}()
 
-	next, err := machine.Fire(ctx, from, event, data)
+	next, err := machine.fire(ctx, from, event, data)
 
 	var step uint64
 	var observers []Observer[S, E, T]

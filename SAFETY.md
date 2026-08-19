@@ -6,6 +6,12 @@ This repository is general-purpose software, not a safety-rated controller or a 
 
 The flat Machine, Instance, queued Runtime, Store-backed execution, Statechart, and supervised Supervisor may coordinate application logic. Hazardous motion must remain bounded by an independent, hazard-analyzed safety layer responsible for functions such as emergency stop, safe torque off, protective stop, guarding, overspeed, collision protection, and human-presence separation.
 
+`Machine.Next` is selection-only: it runs Guards and reports a destination but
+never runs a transition's `Do`. Flat effects are available only through an
+Instance, queued Runtime, or Store-backed execution that owns the associated
+state commit. This prevents an ignored Machine result from leaving an effect
+behind; it does not make arbitrary external I/O atomic or reversible.
+
 The `supervised` module exists for safety-adjacent orchestration where callers need mandatory checks, explicit issue and verification, finite time budgets, first-cause Fault latching, and reconciliation before startup or recovery. It does not preempt arbitrary Go code or stop hardware.
 
 ## Logical and physical state
