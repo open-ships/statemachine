@@ -5,7 +5,8 @@ This repository separates immutable transition definitions from the mutable exec
 ## Language
 
 **Machine**:
-An immutable compiled table defining flat state transitions.
+An immutable compiled table defining flat state transitions. Next runs Guards
+and reports a destination but never runs Do; effects require a state owner.
 _Avoid_: Instance, runtime
 
 **Instance**:
@@ -79,6 +80,8 @@ _Avoid_: Store, Recorder
 ## Relationships
 
 - One **Machine** is shared by zero or more **Instances** and **Runtimes**.
+- A **Machine** may answer a pure Next query for caller-owned state, but only an
+  **Instance**, **Runtime**, or **Store**-backed execution runs a transition's Do.
 - One **Instance** owns exactly one current state.
 - One **Runtime** owns exactly one current state and serializes zero or more **Runs**.
 - One **Run** contains one root event and zero or more follow-up events.

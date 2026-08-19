@@ -98,9 +98,9 @@ var orders = statemachine.MustCompile([]row{
 
 func ctx() context.Context { return context.Background() }
 
-// --- Fire: the three outcomes ------------------------------------------------
+// --- Next: pure transition selection -----------------------------------------
 
-func TestFireSelectsFirstApplicableRow(t *testing.T) {
+func TestNextSelectsFirstApplicableRowWithoutRunningEffects(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		from      state
@@ -113,16 +113,16 @@ func TestFireSelectsFirstApplicableRow(t *testing.T) {
 		{"bare row", draft, cancel, data{}, cancelled, true, nil},
 		{"guard applies", draft, submit, data{lines: 1}, pending, true, nil},
 		{"guard declines, no other row", draft, submit, data{}, draft, false, nil},
-		{"effect runs", pending, pay, data{}, paid, true, []string{"charge"}},
-		{"guarded row wins", paid, ship, data{inStock: true}, shipped, true, []string{"dispatch"}},
+		{"effect is not run", pending, pay, data{}, paid, true, nil},
+		{"guarded row wins without effect", paid, ship, data{inStock: true}, shipped, true, nil},
 		{"default arm wins", paid, ship, data{}, backorder, true, nil},
-		{"self-transition", backorder, ship, data{inStock: true}, backorder, true, []string{"retry"}},
+		{"self-transition without effect", backorder, ship, data{inStock: true}, backorder, true, nil},
 		{"wrong state", shipped, pay, data{}, shipped, false, nil},
 		{"unknown event", draft, event("teleport"), data{}, draft, false, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := tc.d
-			got, err := orders.Fire(ctx(), tc.from, tc.ev, &d)
+			got, err := orders.Next(ctx(), tc.from, tc.ev, &d)
 			if got != tc.want {
 				t.Errorf("state = %v, want %v", got, tc.want)
 			}
@@ -136,8 +136,26 @@ func TestFireSelectsFirstApplicableRow(t *testing.T) {
 	}
 }
 
-func TestFireReturnsFromUnchangedOnEveryFailure(t *testing.T) {
-	// The assignment idiom is only safe because this holds on all three paths.
+func TestMachineNextNeverExecutesDo(t *testing.T) {
+	called := false
+	machine := statemachine.MustCompile([]row{{
+		From: draft, Event: submit, To: pending,
+		Do: func(context.Context, *data) error {
+			called = true
+			panic("Machine.Next crossed the state-ownership seam")
+		},
+	}})
+
+	next, err := machine.Next(ctx(), draft, submit, &data{})
+	if err != nil || next != pending {
+		t.Fatalf("Next = %v, %v; want pending, nil", next, err)
+	}
+	if called {
+		t.Fatal("Machine.Next executed Do")
+	}
+}
+
+func TestInstanceReturnsCommittedStateOnEveryFailure(t *testing.T) {
 	m := statemachine.MustCompile([]row{
 		{From: draft, Event: submit, To: pending, Guard: hasLines},
 		{From: pending, Event: pay, To: paid, Do: fail(errDeclined)},
@@ -153,7 +171,7 @@ func TestFireReturnsFromUnchangedOnEveryFailure(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := data{}
-			got, err := m.Fire(ctx(), tc.from, tc.ev, &d)
+			got, err := statemachine.NewInstance(m, tc.from).Fire(ctx(), tc.ev, &d)
 			if err == nil {
 				t.Fatal("want an error")
 			}
@@ -169,7 +187,7 @@ func TestEffectErrorIsReturnedUnwrapped(t *testing.T) {
 		{From: pending, Event: pay, To: paid, Do: fail(errDeclined)},
 	})
 	d := data{}
-	got, err := m.Fire(ctx(), pending, pay, &d)
+	got, err := statemachine.NewInstance(m, pending).Fire(ctx(), pay, &d)
 
 	if !errors.Is(err, errDeclined) {
 		t.Errorf("errors.Is(err, errDeclined) = false, err = %v", err)
@@ -196,7 +214,7 @@ func TestFailingEffectDoesNotFallThroughToTheNextRow(t *testing.T) {
 		{From: paid, Event: ship, To: backorder, Do: record("backorder")},
 	})
 	d := data{inStock: true}
-	got, err := m.Fire(ctx(), paid, ship, &d)
+	got, err := statemachine.NewInstance(m, paid).Fire(ctx(), ship, &d)
 	if !errors.Is(err, errDeclined) {
 		t.Errorf("err = %v, want the effect's error", err)
 	}
@@ -221,9 +239,9 @@ func TestGuardsRunInTableOrderAndStopAtTheFirstThatApplies(t *testing.T) {
 		{From: draft, Event: submit, To: paid, Guard: guard("second", nil)},
 		{From: draft, Event: submit, To: shipped, Guard: guard("third", nil)},
 	})
-	got, err := m.Fire(ctx(), draft, submit, &data{})
+	got, err := m.Next(ctx(), draft, submit, &data{})
 	if err != nil {
-		t.Fatalf("Fire: %v", err)
+		t.Fatalf("Next: %v", err)
 	}
 	if got != paid {
 		t.Errorf("state = %v, want paid (the second row)", got)
@@ -240,7 +258,7 @@ func TestRefusalCarriesEveryGuardReason(t *testing.T) {
 		{From: paid, Event: ship, To: shipped, Guard: inStock},
 		{From: paid, Event: ship, To: backorder, Guard: hasLines},
 	})
-	_, err := m.Fire(ctx(), paid, ship, &data{})
+	_, err := m.Next(ctx(), paid, ship, &data{})
 
 	if !errors.Is(err, statemachine.ErrNotPermitted) {
 		t.Error("want ErrNotPermitted")
@@ -257,7 +275,7 @@ func TestRefusalCarriesEveryGuardReason(t *testing.T) {
 }
 
 func TestRefusalWithoutReasons(t *testing.T) {
-	_, err := orders.Fire(ctx(), shipped, pay, &data{})
+	_, err := orders.Next(ctx(), shipped, pay, &data{})
 	want := "statemachine: pay in state shipped: transition not permitted"
 	if err.Error() != want {
 		t.Errorf("message = %q, want %q", err.Error(), want)
@@ -270,7 +288,7 @@ func TestRefusalWithoutReasons(t *testing.T) {
 func TestRefusalUnwrapIsStableAndDoesNotRebuild(t *testing.T) {
 	// errors.Is walks Unwrap repeatedly; rebuilding the slice there made a
 	// refusal allocate on every comparison.
-	_, err := orders.Fire(ctx(), draft, submit, &data{})
+	_, err := orders.Next(ctx(), draft, submit, &data{})
 	u, ok := err.(interface{ Unwrap() []error })
 	if !ok {
 		t.Fatal("a refusal must implement Unwrap() []error")
@@ -295,9 +313,9 @@ func TestTypedNilGuardDeclines(t *testing.T) {
 		}},
 		{From: draft, Event: submit, To: cancelled},
 	})
-	got, err := m.Fire(ctx(), draft, submit, &data{})
+	got, err := m.Next(ctx(), draft, submit, &data{})
 	if err != nil {
-		t.Fatalf("Fire: %v", err)
+		t.Fatalf("Next: %v", err)
 	}
 	if got != cancelled {
 		t.Errorf("state = %v, want cancelled — a typed nil declines", got)
@@ -359,11 +377,11 @@ func TestCompileCopiesTheTable(t *testing.T) {
 	table[0].To = cancelled                                         // mutate
 	table = append(table, row{From: pending, Event: pay, To: paid}) // and extend
 
-	got, err := m.Fire(ctx(), draft, submit, &data{})
+	got, err := m.Next(ctx(), draft, submit, &data{})
 	if err != nil || got != pending {
-		t.Errorf("Fire = %v, %v; want pending — the Machine must be immutable", got, err)
+		t.Errorf("Next = %v, %v; want pending — the Machine must be immutable", got, err)
 	}
-	if _, err := m.Fire(ctx(), pending, pay, &data{}); !errors.Is(err, statemachine.ErrNotPermitted) {
+	if _, err := m.Next(ctx(), pending, pay, &data{}); !errors.Is(err, statemachine.ErrNotPermitted) {
 		t.Error("a row appended after Compile must not be in the Machine")
 	}
 	_ = table
@@ -391,9 +409,9 @@ func TestMustCompilePanicsWithCompileError(t *testing.T) {
 
 func TestZeroMachineRefusesEverything(t *testing.T) {
 	var m statemachine.Machine[state, event, *data]
-	got, err := m.Fire(ctx(), draft, submit, &data{})
+	got, err := m.Next(ctx(), draft, submit, &data{})
 	if got != draft || !errors.Is(err, statemachine.ErrNotPermitted) {
-		t.Errorf("Fire = %v, %v; want (draft, ErrNotPermitted)", got, err)
+		t.Errorf("Next = %v, %v; want (draft, ErrNotPermitted)", got, err)
 	}
 	if n := len(maps.Collect(m.Permitted(ctx(), draft, &data{}))); n != 0 {
 		t.Errorf("Permitted yielded %d events, want 0", n)
@@ -406,16 +424,16 @@ func TestCompileOfNilSliceBehavesLikeTheZeroMachine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
-	if _, err := m.Fire(ctx(), draft, submit, &data{}); !errors.Is(err, statemachine.ErrNotPermitted) {
+	if _, err := m.Next(ctx(), draft, submit, &data{}); !errors.Is(err, statemachine.ErrNotPermitted) {
 		t.Errorf("err = %v, want ErrNotPermitted", err)
 	}
 }
 
 // --- Permitted ---------------------------------------------------------------
 
-func TestPermittedMatchesFire(t *testing.T) {
+func TestPermittedMatchesNext(t *testing.T) {
 	// The contract that makes Permitted worth its place: the state it yields is
-	// the state Fire would report, for every event, in every state.
+	// the state Next would report, for every event, in every state.
 	for _, from := range []state{draft, pending, paid, shipped, backorder, cancelled} {
 		for _, inStockNow := range []bool{true, false} {
 			d := data{lines: 1, inStock: inStockNow}
@@ -423,16 +441,16 @@ func TestPermittedMatchesFire(t *testing.T) {
 
 			for _, ev := range []event{submit, pay, ship, cancel} {
 				fresh := data{lines: 1, inStock: inStockNow}
-				got, err := orders.Fire(ctx(), from, ev, &fresh)
+				got, err := orders.Next(ctx(), from, ev, &fresh)
 
 				want, isOffered := offered[ev]
 				switch {
 				case isOffered && err != nil:
-					t.Errorf("%v/%v: offered but Fire refused: %v", from, ev, err)
+					t.Errorf("%v/%v: offered but Next refused: %v", from, ev, err)
 				case isOffered && got != want:
-					t.Errorf("%v/%v: offered %v but Fire reached %v", from, ev, want, got)
+					t.Errorf("%v/%v: offered %v but Next reached %v", from, ev, want, got)
 				case !isOffered && err == nil:
-					t.Errorf("%v/%v: not offered but Fire succeeded to %v", from, ev, got)
+					t.Errorf("%v/%v: not offered but Next succeeded to %v", from, ev, got)
 				}
 			}
 		}
@@ -553,7 +571,7 @@ func TestMachineIsSafeForConcurrentUse(t *testing.T) {
 		wg.Go(func() {
 			for range 200 {
 				d := data{lines: 1, inStock: true}
-				if _, err := orders.Fire(ctx(), paid, ship, &d); err != nil {
+				if _, err := orders.Next(ctx(), paid, ship, &d); err != nil {
 					t.Error(err)
 					return
 				}
@@ -565,21 +583,21 @@ func TestMachineIsSafeForConcurrentUse(t *testing.T) {
 	wg.Wait()
 }
 
-func TestFireIsReentrant(t *testing.T) {
-	// No lock and no in-flight state, so an effect may fire another machine.
+func TestEffectMayFireADistinctInstance(t *testing.T) {
 	inner := statemachine.MustCompile([]row{
 		{From: draft, Event: cancel, To: cancelled, Do: record("inner")},
 	})
+	innerRun := statemachine.NewInstance(inner, draft)
 	outer := statemachine.MustCompile([]row{
 		{From: pending, Event: pay, To: paid, Do: func(c context.Context, d *data) error {
-			_, err := inner.Fire(c, draft, cancel, d)
+			_, err := innerRun.Fire(c, cancel, d)
 			return err
 		}},
 	})
 	d := data{}
-	got, err := outer.Fire(ctx(), pending, pay, &d)
+	got, err := statemachine.NewInstance(outer, pending).Fire(ctx(), pay, &d)
 	if err != nil {
-		t.Fatalf("Fire: %v", err)
+		t.Fatalf("Instance.Fire: %v", err)
 	}
 	if got != paid {
 		t.Errorf("state = %v, want paid — the outer row's To, not the nested one's", got)
@@ -591,13 +609,13 @@ func TestFireIsReentrant(t *testing.T) {
 
 // --- Documented invariants ---------------------------------------------------
 
-func TestFireIgnoresContextCancellation(t *testing.T) {
-	// Fire never reads ctx; only Guard and Do may honor it.
+func TestNextIgnoresContextCancellation(t *testing.T) {
+	// Next never reads ctx; Guards may honor it.
 	dead, stop := context.WithCancel(ctx())
 	stop()
-	got, err := orders.Fire(dead, draft, cancel, &data{})
+	got, err := orders.Next(dead, draft, cancel, &data{})
 	if err != nil {
-		t.Errorf("err = %v; Fire must not check ctx itself", err)
+		t.Errorf("err = %v; Next must not check ctx itself", err)
 	}
 	if got != cancelled {
 		t.Errorf("state = %v, want cancelled", got)
@@ -619,8 +637,8 @@ func TestContextReachesGuardsAndEffects(t *testing.T) {
 		{From: draft, Event: submit, To: pending, Guard: probe("guard"), Do: probe("do")},
 	})
 	c := context.WithValue(ctx(), ckey{}, "carried")
-	if _, err := m.Fire(c, draft, submit, &data{}); err != nil {
-		t.Fatalf("Fire: %v", err)
+	if _, err := statemachine.NewInstance(m, draft).Fire(c, submit, &data{}); err != nil {
+		t.Fatalf("Instance.Fire: %v", err)
 	}
 	if want := []string{"guard", "do"}; !slices.Equal(seen, want) {
 		t.Errorf("ctx reached %v, want %v", seen, want)
@@ -629,9 +647,9 @@ func TestContextReachesGuardsAndEffects(t *testing.T) {
 
 func TestNilGuardAndNilEffectAreNoOps(t *testing.T) {
 	m := statemachine.MustCompile([]row{{From: draft, Event: submit, To: pending}})
-	got, err := m.Fire(ctx(), draft, submit, &data{})
+	got, err := m.Next(ctx(), draft, submit, &data{})
 	if got != pending || err != nil {
-		t.Errorf("Fire = %v, %v; want (pending, nil)", got, err)
+		t.Errorf("Next = %v, %v; want (pending, nil)", got, err)
 	}
 }
 
@@ -640,9 +658,9 @@ func TestSelfTransitionRunsItsEffectOnce(t *testing.T) {
 		{From: paid, Event: ship, To: paid, Do: record("retry")},
 	})
 	d := data{}
-	got, err := m.Fire(ctx(), paid, ship, &d)
+	got, err := statemachine.NewInstance(m, paid).Fire(ctx(), ship, &d)
 	if got != paid || err != nil {
-		t.Fatalf("Fire = %v, %v", got, err)
+		t.Fatalf("Instance.Fire = %v, %v", got, err)
 	}
 	if !slices.Equal(d.trace, []string{"retry"}) {
 		t.Errorf("trace = %v, want exactly one run", d.trace)
@@ -652,9 +670,9 @@ func TestSelfTransitionRunsItsEffectOnce(t *testing.T) {
 func TestUnknownStateHasNoAffordances(t *testing.T) {
 	// A value loaded from storage that no row mentions: refuses, never panics.
 	corrupt := state("who-knows")
-	got, err := orders.Fire(ctx(), corrupt, ship, &data{})
+	got, err := orders.Next(ctx(), corrupt, ship, &data{})
 	if got != corrupt || !errors.Is(err, statemachine.ErrNotPermitted) {
-		t.Errorf("Fire = %v, %v; want (%v, ErrNotPermitted)", got, err, corrupt)
+		t.Errorf("Next = %v, %v; want (%v, ErrNotPermitted)", got, err, corrupt)
 	}
 	if n := len(maps.Collect(orders.Permitted(ctx(), corrupt, &data{}))); n != 0 {
 		t.Errorf("Permitted yielded %d events for an unknown state", n)
@@ -662,7 +680,7 @@ func TestUnknownStateHasNoAffordances(t *testing.T) {
 }
 
 func TestRefusalMessageNamesTheEventAndState(t *testing.T) {
-	_, err := orders.Fire(ctx(), shipped, ship, &data{})
+	_, err := orders.Next(ctx(), shipped, ship, &data{})
 	for _, want := range []string{"statemachine:", string(ship), string(shipped)} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("message %q does not mention %q", err, want)
@@ -672,7 +690,7 @@ func TestRefusalMessageNamesTheEventAndState(t *testing.T) {
 
 // --- Benchmarks --------------------------------------------------------------
 
-// benchMachine has no recording effects, so the benchmarks below measure Fire
+// benchMachine has no recording effects, so the benchmarks below measure Next
 // rather than a test fixture's growing trace slice.
 var benchMachine = statemachine.MustCompile([]row{
 	{From: paid, Event: ship, To: shipped, Guard: inStock},
@@ -681,36 +699,36 @@ var benchMachine = statemachine.MustCompile([]row{
 })
 
 // The accepted path: a map lookup, one guard, and a return.
-func BenchmarkFireAccepted(b *testing.B) {
+func BenchmarkNextAccepted(b *testing.B) {
 	d := data{lines: 1, inStock: true}
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _ = benchMachine.Fire(ctx(), paid, ship, &d)
+		_, _ = benchMachine.Next(ctx(), paid, ship, &d)
 	}
 }
 
 // The default arm: the first guard declines, so a reason is collected and
 // discarded before the second row wins.
-func BenchmarkFireDefaultArm(b *testing.B) {
+func BenchmarkNextDefaultArm(b *testing.B) {
 	d := data{}
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _ = benchMachine.Fire(ctx(), paid, ship, &d)
+		_, _ = benchMachine.Next(ctx(), paid, ship, &d)
 	}
 }
 
 // The refused path, which the docs steer callers toward instead of
 // check-then-act: it must not be expensive.
-func BenchmarkFireRefused(b *testing.B) {
+func BenchmarkNextRefused(b *testing.B) {
 	d := data{}
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _ = benchMachine.Fire(ctx(), shipped, pay, &d)
+		_, _ = benchMachine.Next(ctx(), shipped, pay, &d)
 	}
 }
 
 func BenchmarkRefusalErrorsIs(b *testing.B) {
-	_, err := orders.Fire(ctx(), draft, submit, &data{})
+	_, err := orders.Next(ctx(), draft, submit, &data{})
 	b.ReportAllocs()
 	for b.Loop() {
 		if !errors.Is(err, statemachine.ErrNotPermitted) {
@@ -757,8 +775,8 @@ func TestStrictComparableTypesAndDynamicValuesNeverPanic(t *testing.T) {
 		t.Fatalf("nested interface Compile = %v", err)
 	}
 	var zero statemachine.Machine[any, any, struct{}]
-	if _, err := zero.Fire(context.Background(), any([]int{1}), "start", struct{}{}); !errors.Is(err, statemachine.ErrInvalidKey) {
-		t.Fatalf("zero Fire = %v", err)
+	if _, err := zero.Next(context.Background(), any([]int{1}), "start", struct{}{}); !errors.Is(err, statemachine.ErrInvalidKey) {
+		t.Fatalf("zero Next = %v", err)
 	}
 }
 

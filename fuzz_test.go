@@ -112,11 +112,11 @@ func referenceFire(rows []fuzzRow, from fuzzState, event fuzzEvent) (fuzzState, 
 	return from, false, false, declined
 }
 
-// FuzzMachineFire drives arbitrary tables and event sequences through the
-// compiled Machine and asserts exact agreement with the reference
+// FuzzInstanceFire drives arbitrary tables and event sequences through a
+// state-owning Instance and asserts exact agreement with the reference
 // interpreter: selected row, resulting state, error identity, and refusal
 // reasons.
-func FuzzMachineFire(f *testing.F) {
+func FuzzInstanceFire(f *testing.F) {
 	f.Add([]byte{0, 0, 1, 0}, []byte{0, 0})
 	f.Add([]byte{0, 0, 1, 3, 0, 0, 2, 0}, []byte{0, 0, 1, 1})
 	f.Add([]byte{0, 0, 1, 4}, []byte{0, 0})
@@ -144,7 +144,8 @@ func FuzzMachineFire(f *testing.F) {
 			event := fuzzEvent(fires[index+1] % 4)
 			wantState, wantOK, wantEffectErr, declined := referenceFire(rows, from, event)
 
-			got, err := machine.Fire(ctx, from, event, 0)
+			execution := statemachine.NewInstance(machine, from)
+			got, err := execution.Fire(ctx, event, 0)
 			if got != wantState {
 				t.Fatalf("Fire(%v, %v) state = %v, want %v (rows %+v)", from, event, got, wantState, rows)
 			}
@@ -210,14 +211,14 @@ func FuzzZeroAndCompiledKeyChecks(f *testing.F) {
 		var zero statemachine.Machine[fuzzState, fuzzEvent, int]
 		state := fuzzState(stateByte)
 		event := fuzzEvent(eventByte)
-		got, err := zero.Fire(context.Background(), state, event, 0)
+		got, err := zero.Next(context.Background(), state, event, 0)
 		if got != state || !errors.Is(err, statemachine.ErrNotPermitted) {
-			t.Fatalf("zero Machine Fire = %v, %v", got, err)
+			t.Fatalf("zero Machine Next = %v, %v", got, err)
 		}
 		compiled := statemachine.MustCompile([]statemachine.Transition[fuzzState, fuzzEvent, int]{})
-		got, err = compiled.Fire(context.Background(), state, event, 0)
+		got, err = compiled.Next(context.Background(), state, event, 0)
 		if got != state || !errors.Is(err, statemachine.ErrNotPermitted) {
-			t.Fatalf("empty compiled Machine Fire = %v, %v", got, err)
+			t.Fatalf("empty compiled Machine Next = %v, %v", got, err)
 		}
 	})
 }

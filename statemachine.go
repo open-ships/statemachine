@@ -14,7 +14,7 @@ import (
 // table has this From and Event, or every row that does has a Guard that
 // declined.
 //
-// The error [Machine.Fire] reports wraps ErrNotPermitted together with every
+// The error [Machine.Next] reports wraps ErrNotPermitted together with every
 // reason a Guard returned during the attempt — it implements
 // Unwrap() []error — so both of these can hold at once:
 //
@@ -24,10 +24,10 @@ import (
 // Test for your own reasons first: they are the more precise answer, and the
 // only one a caller can act on.
 //
-// Like every sentinel in Go, this one travels: a Guard or Do that fires
-// another Machine and returns that call's refusal will make errors.Is report a
-// refusal for a transition this Machine permitted. Wrapping with %w does not
-// help — it preserves the sentinel. Return a different error instead.
+// Like every sentinel in Go, this one travels: returning a nested execution's
+// refusal from a Guard or Do will make errors.Is report that refusal to its
+// caller. Wrapping with %w does not help — it preserves the sentinel. Return a
+// different error instead.
 var (
 	ErrNotPermitted = errors.New("transition not permitted")
 	// ErrInvalidKey reports a state or event value that cannot safely be used
@@ -36,7 +36,7 @@ var (
 )
 
 // A Transition is one row of a transition table: in state From, event Event
-// moves the machine to state To.
+// moves an execution to state To.
 //
 // Declare an alias to keep tables readable — note the =, which makes it an
 // alias rather than a defined type, so that [Compile] can still infer S, E and
@@ -78,18 +78,19 @@ type Transition[S, E comparable, T any] struct {
 	// Return a nil error, never a typed nil: a (*MyError)(nil) returned as an
 	// error is non-nil, so the row silently declines and the next one wins.
 	//
-	// Guard must not modify data, perform I/O or panic: [Machine.Fire] calls it
+	// Guard must not modify data, perform I/O or panic: [Machine.Next] calls it
 	// on rows it does not select, and [Machine.Permitted] calls it while
 	// iterating. Nothing enforces this.
 	Guard func(ctx context.Context, data T) error
 
-	// Do performs the effect of the transition. It runs once, after this row is
-	// selected and before Fire reports the new state, so the state advances if
-	// and only if Do returned nil. A nil Do does nothing.
+	// Do performs the effect of the transition. It is never run by [Machine.Next]
+	// or [Machine.Permitted]. It runs only through a state-owning execution such
+	// as [Instance], queued.Runtime, or persist Store-backed execution. A nil Do
+	// does nothing.
 	//
-	// Do is the only thing that can fail a row that was selected, and the error
-	// it returns is the error Fire returns, unwrapped. A failing Do does not
-	// fall through to the next matching row: the row was already chosen.
+	// Do runs once after its row is selected and before the execution publishes
+	// the destination. A failing Do leaves that execution's state unchanged and
+	// does not fall through to the next matching row: the row was already chosen.
 	Do func(ctx context.Context, data T) error
 }
 
@@ -103,13 +104,13 @@ type key[S, E comparable] struct {
 //
 // A Machine is immutable and safe for concurrent use by any number of
 // goroutines. This package takes no locks, so no deadlock originates here; the
-// state values and the data passed to [Machine.Fire] belong to the caller and
+// state values and the data passed to [Machine.Next] belong to the caller and
 // are the caller's to synchronize. The zero Machine has no rows and refuses
 // every event.
 //
 // S and E must be strictly comparable. Go's comparable constraint also admits
 // interface-bearing types; Compile rejects them before building any map. A
-// zero Machine reports [ErrInvalidKey] from Fire for an uncomparable dynamic
+// zero Machine reports [ErrInvalidKey] from Next for an uncomparable dynamic
 // value, while Permitted returns an empty sequence. Prefer distinct defined
 // string or integer types for S and E.
 type Machine[S, E comparable, T any] struct {
@@ -119,7 +120,7 @@ type Machine[S, E comparable, T any] struct {
 	// strict records that Compile proved S and E free of interface-bearing
 	// types, so no dynamic value of either can be an uncomparable map key.
 	// Strictness is a property of the type: once proved at compile time, the
-	// per-value reflection check in Fire and Permitted is unnecessary. The
+	// per-value reflection check in Next and Permitted is unnecessary. The
 	// zero Machine has not been through Compile and keeps the per-value check.
 	strict bool
 }
@@ -192,69 +193,86 @@ func MustCompile[S, E comparable, T any](transitions []Transition[S, E, T]) *Mac
 	return m
 }
 
-// Fire applies event to state from and reports the state to move to.
+// Next selects the transition for event in state from and reports its
+// destination without running its effect.
 //
-// Fire considers the rows whose From and Event match, in table order, and
-// selects the first whose Guard is nil or returns nil. It runs that row's Do
-// and, if Do returns nil, reports the row's To. A failing Do does not fall
-// through to the next row.
+// Next considers the rows whose From and Event match, in table order, and
+// selects the first whose Guard is nil or returns nil. It reports that row's
+// To. It never calls Do, so discarding its result cannot leave an effect behind.
 //
-// In every other case Fire reports from, unchanged, so assigning the result is
-// always correct:
+// In every other case Next reports from, unchanged:
 //
-//	var err error
-//	order.State, err = orders.Fire(ctx, order.State, Pay, cmd)
+//	next, err := orders.Next(ctx, order.State, Pay, cmd)
 //
-// Discarding it never is: the effect has already run, and neither the compiler
-// nor go vet reports the lost transition.
+// Next is for planning and for caller-owned transitions whose selected row has
+// no Do. Use a state-owning execution to perform a transition with an effect;
+// assigning Next's destination would deliberately skip that effect.
 //
 // The error wraps [ErrNotPermitted], and every reason a Guard returned, when no
-// row was selected; otherwise it is exactly the error Do returned.
+// row was selected. A selected row always returns a nil error because Next does
+// not execute effects.
 //
-// Fire reads the state from the from argument, never from data. A Guard or Do
-// that writes a state field on data is writing a second copy that this package
-// neither reads nor updates: the write is discarded on success and left behind
-// on failure.
+// Next reads the state from the from argument, never from data. A Guard that
+// writes a state field on data is writing a second copy that this package
+// neither reads nor updates.
 //
-// Fire never reads ctx. It passes ctx to Guard and Do, which may honor
-// cancellation themselves; a Fire under an already-cancelled context still
-// transitions if its Guard and Do do not object.
-//
-// A Guard or Do may call Fire — on this Machine or another — with no
-// restriction, because there is no lock and no in-flight state. What a nested
-// call reaches is returned only to the nested caller: the outer Fire still
-// reports its own row's To on success, and reports from on failure, discarding
-// any state the nested call reached while its effects stand. Nest only across
-// distinct aggregates, and never fire the machine that owns the state the
-// current transition is advancing.
-func (m *Machine[S, E, T]) Fire(ctx context.Context, from S, event E, data T) (S, error) {
+// Next never reads ctx itself. It passes ctx to Guard, which may honor
+// cancellation; a Next under an already-cancelled context still selects a row
+// if its Guard does not object.
+func (m *Machine[S, E, T]) Next(ctx context.Context, from S, event E, data T) (S, error) {
+	transition, err := m.selectTransition(ctx, from, event, data)
+	if err != nil {
+		return from, err
+	}
+	return transition.To, nil
+}
+
+// fire is the effectful half of flat execution. Keeping it package-private is
+// the architectural invariant: a caller-owned state value can ask a Machine
+// what comes next, but only a state-owning Instance can perform Do.
+func (m *Machine[S, E, T]) fire(ctx context.Context, from S, event E, data T) (S, error) {
+	transition, err := m.selectTransition(ctx, from, event, data)
+	if err != nil {
+		return from, err
+	}
+	if transition.Do != nil {
+		if err := transition.Do(ctx, data); err != nil {
+			return from, err
+		}
+	}
+	return transition.To, nil
+}
+
+func (m *Machine[S, E, T]) selectTransition(
+	ctx context.Context,
+	from S,
+	event E,
+	data T,
+) (*Transition[S, E, T], error) {
 	if !m.strict && (!keycheck.Value(from) || !keycheck.Value(event)) {
-		return from, ErrInvalidKey
+		return nil, ErrInvalidKey
 	}
 	var reasons []error
-	for _, t := range m.rows[key[S, E]{from, event}] {
+	rows := m.rows[key[S, E]{from, event}]
+	for index := range rows {
+		t := &rows[index]
 		if t.Guard != nil {
 			if err := t.Guard(ctx, data); err != nil {
 				reasons = append(reasons, err)
 				continue
 			}
 		}
-		if t.Do != nil {
-			if err := t.Do(ctx, data); err != nil {
-				return from, err
-			}
-		}
-		return t.To, nil
+		return t, nil
 	}
-	return from, &refusal[S, E]{from, event, append([]error{ErrNotPermitted}, reasons...)}
+	return nil, &refusal[S, E]{from, event, append([]error{ErrNotPermitted}, reasons...)}
 }
 
-// Permitted iterates the events [Machine.Fire] would accept in state from for
-// data, each paired with the state that firing it would reach.
+// Permitted iterates the events [Machine.Next] would accept in state from for
+// data, each paired with the state that selecting it would reach.
 //
 // An event is yielded at most once, in the order of the first row that mentions
-// it for from, and the state yielded with it is exactly the state Fire would
-// report, because Permitted selects rows by the rule Fire uses. An event whose
+// it for from, and the state yielded with it is exactly the state Next would
+// report, because Permitted selects rows by the rule Next uses. An event whose
 // every matching row declines is not yielded. No Do runs and nothing changes.
 //
 // The iterator is lazy: Guards run as it is ranged, not when Permitted is
@@ -263,14 +281,12 @@ func (m *Machine[S, E, T]) Fire(ctx context.Context, from S, event E, data T) (S
 // the remaining Guards uncalled. If you adapt it with [iter.Pull2], call the
 // returned stop function.
 //
-// Permitted and Fire agree on row selection when passed equal data. They can
-// still disagree on outcome: a Do may fail, and data assembled for display
-// often omits fields — a request payload, an open transaction — that a Guard
-// consults. Pass the same construction to both, or keep guard-relevant fields
-// where both can see them.
+// Permitted and Next agree on row selection when passed equal data. Data
+// assembled for display often omits fields that a Guard consults; pass the same
+// construction to both, or keep guard-relevant fields where both can see them.
 //
 // Use Permitted to offer choices — the buttons on a page, the links in a
-// response — not to decide whether to fire. Firing and handling
+// response — not to decide whether to execute. Executing and handling
 // [ErrNotPermitted] cannot go stale between the question and the answer.
 func (m *Machine[S, E, T]) Permitted(ctx context.Context, from S, data T) iter.Seq2[E, S] {
 	return func(yield func(E, S) bool) {
@@ -291,7 +307,8 @@ func (m *Machine[S, E, T]) Permitted(ctx context.Context, from S, data T) iter.S
 	}
 }
 
-// refusal is the error Fire returns when no row was selected. It holds from and
+// refusal is the error Next and state-owning executions return when no row was
+// selected. It holds from and
 // event rather than a formatted string so that the common path — errors.Is,
 // without ever printing the error — does not format one, and it holds its
 // unwrap slice rather than rebuilding it on every errors.Is call.

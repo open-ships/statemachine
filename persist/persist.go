@@ -76,7 +76,8 @@ type FuncStore[K, S comparable, X any] struct {
 
 // StepResult describes the transition attempt made inside a Store update.
 // From and To are meaningful only when Attempted is true. TransitionError is
-// the exact error returned by Machine.Fire, before any later Store error.
+// the exact error returned by the state-owning transition execution, before
+// any later Store error.
 // Confirmed is true only when Store.Update returned success; false does not
 // prove that an external commit did not happen.
 type StepResult[S, E comparable] struct {
@@ -171,7 +172,8 @@ func apply[K, S, E comparable, T, X any](
 		result.From = from
 		result.To = from
 		result.Attempted = true
-		to, transitionErr := machine.Fire(ctx, from, event, value)
+		execution := statemachine.NewInstance(machine, from)
+		to, transitionErr := execution.Fire(ctx, event, value)
 		result.To = to
 		result.TransitionError = transitionErr
 		return to, transitionErr

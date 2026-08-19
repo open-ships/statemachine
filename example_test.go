@@ -29,7 +29,7 @@ func Example() {
 
 	s := Off
 	for range 3 {
-		s, _ = light.Fire(context.Background(), s, Flip, struct{}{})
+		s, _ = light.Next(context.Background(), s, Flip, struct{}{})
 		fmt.Println(s)
 	}
 
@@ -67,9 +67,8 @@ const (
 	Refund  Event = "refund"
 )
 
-// Order is the aggregate used by the caller-owned Machine examples. In that
-// execution model State is an ordinary field: restoration means loading it and
-// passing it to Fire.
+// Order is the aggregate used by the pure Machine examples. State is an
+// ordinary field passed to Next; effects require a state-owning execution.
 type Order struct {
 	ID      string
 	State   State
@@ -79,7 +78,7 @@ type Order struct {
 }
 
 // Cmd is the third type parameter: the aggregate plus whatever this particular
-// command needs. It is passed to Fire rather than stored, so one immutable
+// command needs. It is passed to Next or a state-owning execution rather than stored, so one immutable
 // Machine serves every request while still seeing request-scoped values.
 type Cmd struct {
 	Order *Order
@@ -150,39 +149,35 @@ var orderTable = []Row{
 
 var lifecycle = statemachine.MustCompile(orderTable)
 
-// Fire reports where to go next; the caller owns the state and writes it down.
-func ExampleMachine_Fire() {
+// Next reports where to go next without running the selected row's effect.
+func ExampleMachine_Next() {
 	ctx := context.Background()
 	o := &Order{ID: "A1", State: Draft, Lines: 2}
 
 	var err error
-	o.State, err = lifecycle.Fire(ctx, o.State, Submit, &Cmd{Order: o})
+	o.State, err = lifecycle.Next(ctx, o.State, Submit, &Cmd{Order: o})
 	fmt.Println(o.State, err)
 
 	// A guard declined and no other row applied: the state is unchanged and the
 	// reason travels with the refusal.
 	empty := &Order{ID: "A2", State: Draft}
-	next, err := lifecycle.Fire(ctx, empty.State, Submit, &Cmd{Order: empty})
+	next, err := lifecycle.Next(ctx, empty.State, Submit, &Cmd{Order: empty})
 	fmt.Println(next, err)
 	fmt.Println("refused:", errors.Is(err, statemachine.ErrNotPermitted),
 		"| why:", errors.Is(err, ErrNoLines))
 
-	// An effect failed: Fire returns the effect's own error, unwrapped, and the
-	// state does not advance.
-	next, err = lifecycle.Fire(ctx, o.State, Pay, &Cmd{Order: o})
-	fmt.Println(next, err)
-	fmt.Println("refused:", errors.Is(err, statemachine.ErrNotPermitted),
-		"| declined:", errors.Is(err, ErrDeclined))
+	// Pay has a charge effect, but asking what comes next cannot run it.
+	next, err = lifecycle.Next(ctx, o.State, Pay, &Cmd{Order: o})
+	fmt.Println(next, err, "charged:", o.Charged)
 
 	// Output:
 	// pending <nil>
 	// draft statemachine: submit in state draft: transition not permitted: order has no lines
 	// refused: true | why: true
-	// pending card declined
-	// refused: false | declined: true
+	// paid <nil> charged: false
 }
 
-// Permitted answers "what may happen next", following the same guards Fire
+// Permitted answers "what may happen next", following the same guards Next
 // follows, so a rendered affordance and the server that receives it cannot
 // disagree about where an event leads.
 func ExampleMachine_Permitted() {
@@ -240,7 +235,8 @@ func Example_httpStatus() {
 		{State: Draft},           // no lines
 		{State: Delivered},       // wrong state for submit
 	} {
-		_, err := lifecycle.Fire(ctx, o.State, Submit, &Cmd{Order: o})
+		run := statemachine.NewInstance(lifecycle, o.State)
+		_, err := run.Fire(ctx, Submit, &Cmd{Order: o})
 		fmt.Println(classify(err))
 	}
 
@@ -357,7 +353,9 @@ func Example_entryAction() {
 	for _, from := range []State{Draft, Pending, Paid} {
 		o := &Order{State: from}
 		c := &Cmd{Order: o}
-		o.State, _ = machine.Fire(ctx, o.State, Cancel, c)
+		run := statemachine.NewInstance(machine, o.State)
+		_, _ = run.Fire(ctx, Cancel, c)
+		o.State = run.State()
 		fmt.Println(from, "->", o.State, c.Log)
 	}
 
@@ -391,7 +389,7 @@ func Example_fanIn() {
 		fmt.Println("compile:", err)
 		return
 	}
-	next, err := machine.Fire(context.Background(), Shipped, Cancel, &Cmd{})
+	next, err := machine.Next(context.Background(), Shipped, Cancel, &Cmd{})
 	fmt.Println(Shipped, "->", next, err)
 
 	// Output:

@@ -64,8 +64,7 @@ var defaultLimits = Limits{MaxRoots: DefaultMaxRoots, MaxRunEvents: DefaultMaxRu
 // whenever the root queue becomes empty.
 type Runtime[S, E comparable, T any] struct {
 	mu        sync.Mutex
-	machine   statemachine.Machine[S, E, T]
-	state     S
+	instance  statemachine.Instance[S, E, T]
 	roots     []*root[E, T, S]
 	running   bool
 	limits    Limits
@@ -118,11 +117,9 @@ func newRuntime[S, E comparable, T any](
 	observers []statemachine.Observer[S, E, T],
 ) *Runtime[S, E, T] {
 	runtime := &Runtime[S, E, T]{
-		state: initial, limits: limits, observers: copyObservers(observers),
+		limits: limits, observers: copyObservers(observers),
 	}
-	if machine != nil {
-		runtime.machine = *machine
-	}
+	runtime.instance = *statemachine.NewInstance(machine, initial)
 	return runtime
 }
 
@@ -130,9 +127,7 @@ func newRuntime[S, E comparable, T any](
 // continues to report the state that event started from; the destination is
 // published only after Do returns nil.
 func (r *Runtime[S, E, T]) State() S {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.state
+	return r.instance.State()
 }
 
 // Status reports committed state, scheduler activity, admitted roots, and
@@ -145,7 +140,7 @@ func (r *Runtime[S, E, T]) Status() Status[S] {
 		limits = defaultLimits
 	}
 	return Status[S]{
-		State: r.state, Running: r.running,
+		State: r.instance.State(), Running: r.running,
 		OutstandingRoots: r.rootCount, Limits: limits,
 	}
 }
@@ -191,7 +186,7 @@ func (r *Runtime[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error)
 		r.limits = defaultLimits
 	}
 	if r.rootCount >= r.limits.MaxRoots {
-		state := r.state
+		state := r.instance.State()
 		r.mu.Unlock()
 		return state, ErrRootLimit
 	}
@@ -248,17 +243,12 @@ func (r *Runtime[S, E, T]) removeRootLocked(target *root[E, T, S]) bool {
 // can overlap an executing callback; callers must synchronize mutable data in
 // T and keep Guards pure.
 func (r *Runtime[S, E, T]) Permitted(ctx context.Context, data T) iter.Seq2[E, S] {
-	r.mu.Lock()
-	state := r.state
-	machine := r.machine
-	r.mu.Unlock()
-
 	type pair struct {
 		event E
 		to    S
 	}
 	var snapshot []pair
-	for event, to := range machine.Permitted(ctx, state, data) {
+	for event, to := range r.instance.Permitted(ctx, data) {
 		snapshot = append(snapshot, pair{event, to})
 	}
 
@@ -489,7 +479,7 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 		}
 
 		from := r.State()
-		to, err := r.fireMachine(current.ctx, from, current.event, current.data)
+		to, err := r.instance.Fire(current.ctx, current.event, current.data)
 		if err != nil {
 			c.abort()
 			result = outcome[S]{state: r.State(), err: err}
@@ -499,7 +489,6 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 		var step uint64
 		var observers []statemachine.Observer[S, E, T]
 		r.mu.Lock()
-		r.state = to
 		if from != to && len(r.observers) != 0 {
 			step = r.seq + 1
 			r.seq += 2
@@ -531,8 +520,4 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 	}
 	completed = true
 	return result
-}
-
-func (r *Runtime[S, E, T]) fireMachine(ctx context.Context, from S, event E, data T) (S, error) {
-	return r.machine.Fire(ctx, from, event, data)
 }
