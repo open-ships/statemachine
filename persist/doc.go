@@ -10,7 +10,11 @@
 // call made by an effect cannot be rolled back by the Store.
 //
 // A Store must never retry the callback. Fire and Step enforce one invocation
-// per call and report [ErrStoreContract] if an adapter repeats or omits it.
+// per call and report [ErrStoreContract] if an adapter repeats or omits it, or
+// reports success after a failed callback or with a different state. These
+// checks cannot verify that an adapter actually persisted its reported result.
+// A Store that returns after swallowing a callback panic or runtime.Goexit is
+// also rejected as an incomplete callback.
 // Effects may have escaped before a version conflict, cancellation, or commit failure is discovered. Retrying is
 // therefore a domain decision, not a storage convenience. A caller that does
 // retry should reload first and use a stable idempotency key. An outbox should
@@ -28,4 +32,11 @@
 // the transition callback ran, its From and attempted To, and whether the Store
 // confirmed success. A failed Store result is never treated as proof that an
 // external commit did not occur.
+//
+// Production database adapters remain application-owned. The persist/persisttest
+// package supplies reusable contract checks; applications should also test
+// isolation, conditional writes, effect rollback, and outbox atomicity against
+// their actual database. The repository's separate integration/sqlite module
+// demonstrates those checks against SQLite without adding dependencies to
+// this library.
 package persist

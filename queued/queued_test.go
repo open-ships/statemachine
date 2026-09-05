@@ -762,10 +762,17 @@ var benchmarkRuntimeMachine = statemachine.MustCompile([]row{
 func BenchmarkRuntimeFire(b *testing.B) {
 	r := queued.New(benchmarkRuntimeMachine, state(0))
 	data := &command{}
+	ev := start
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _ = r.Fire(context.Background(), start, data)
-		_, _ = r.Fire(context.Background(), after, data)
+		if _, err := r.Fire(context.Background(), ev, data); err != nil {
+			b.Fatal(err)
+		}
+		if ev == start {
+			ev = after
+		} else {
+			ev = start
+		}
 	}
 }
 
@@ -776,9 +783,16 @@ func BenchmarkRuntimeFireObserved(b *testing.B) {
 		func(context.Context, statemachine.Observation[state, event], *command) {},
 	)
 	data := &command{}
+	ev := start
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _ = r.Fire(context.Background(), start, data)
-		_, _ = r.Fire(context.Background(), after, data)
+		if _, err := r.Fire(context.Background(), ev, data); err != nil {
+			b.Fatal(err)
+		}
+		if ev == start {
+			ev = after
+		} else {
+			ev = start
+		}
 	}
 }

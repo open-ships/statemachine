@@ -635,9 +635,16 @@ func BenchmarkInstanceFire(b *testing.B) {
 	instance := statemachine.NewInstance(benchmarkInstanceMachine, instanceIdle)
 	data := &instanceData{}
 	b.ReportAllocs()
+	event := instanceStart
 	for b.Loop() {
-		_, _ = instance.Fire(context.Background(), instanceStart, data)
-		_, _ = instance.Fire(context.Background(), instanceFinish, data)
+		if _, err := instance.Fire(context.Background(), event, data); err != nil {
+			b.Fatal(err)
+		}
+		if event == instanceStart {
+			event = instanceFinish
+		} else {
+			event = instanceStart
+		}
 	}
 }
 
@@ -649,8 +656,15 @@ func BenchmarkInstanceFireObserved(b *testing.B) {
 	)
 	data := &instanceData{}
 	b.ReportAllocs()
+	event := instanceStart
 	for b.Loop() {
-		_, _ = instance.Fire(context.Background(), instanceStart, data)
-		_, _ = instance.Fire(context.Background(), instanceFinish, data)
+		if _, err := instance.Fire(context.Background(), event, data); err != nil {
+			b.Fatal(err)
+		}
+		if event == instanceStart {
+			event = instanceFinish
+		} else {
+			event = instanceStart
+		}
 	}
 }

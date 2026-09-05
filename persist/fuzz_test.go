@@ -186,3 +186,42 @@ func FuzzMemoryStoreSerialization(f *testing.F) {
 		}
 	})
 }
+
+// FuzzStoreSuccessConsistency checks fabricated successful adapter responses
+// against the callback's independently recorded outcome.
+func FuzzStoreSuccessConsistency(f *testing.F) {
+	f.Add(false, uint8(1))
+	f.Add(false, uint8(0))
+	f.Add(true, uint8(1))
+	f.Fuzz(func(t *testing.T, effectFails bool, returned uint8) {
+		failure := errors.New("fuzz: transition failed")
+		machine := statemachine.MustCompile([]statemachine.Transition[fuzzState, fuzzEvent, int]{{
+			From: fuzzIdle, Event: fuzzGo, To: fuzzRunning,
+			Do: func(context.Context, int) error {
+				if effectFails {
+					return failure
+				}
+				return nil
+			},
+		}})
+		store := persist.FuncStore[string, fuzzState, struct{}]{UpdateFunc: func(ctx context.Context, _ string, step func(context.Context, fuzzState, struct{}) (fuzzState, error)) (fuzzState, error) {
+			_, _ = step(ctx, fuzzIdle, struct{}{})
+			return fuzzState(returned % 3), nil
+		}}
+		result, err := persist.Step(context.Background(), store, "key", machine, fuzzGo, nil)
+		switch {
+		case effectFails:
+			if !errors.Is(err, persist.ErrStepFailed) || !errors.Is(err, failure) || result.Confirmed {
+				t.Fatalf("failed callback with Store success = %+v, %v", result, err)
+			}
+		case returned%3 != uint8(fuzzRunning):
+			if !errors.Is(err, persist.ErrStateMismatch) || result.Confirmed {
+				t.Fatalf("contradictory destination = %+v, %v", result, err)
+			}
+		default:
+			if err != nil || !result.Confirmed {
+				t.Fatalf("consistent Store success = %+v, %v", result, err)
+			}
+		}
+	})
+}

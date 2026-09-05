@@ -3,6 +3,8 @@ package statechart
 import (
 	"fmt"
 	"iter"
+
+	"github.com/open-ships/statemachine/internal/keycheck"
 )
 
 // Status reports one state's membership in a Position.
@@ -31,25 +33,29 @@ func (s Status) String() string {
 }
 
 type shapeNode[S comparable] struct {
-	state  S
-	parent int
-	enter  int
-	exit   int
+	state       S
+	parent      int
+	depth       int
+	enter       int
+	exit        int
+	destination int
 }
 
 type shape[S comparable] struct {
-	nodes []shapeNode[S]
-	index map[S]int
+	nodes     []shapeNode[S]
+	index     map[S]int
+	reflexive bool
 }
 
-func compileShape[S comparable](order []S, parents map[S]S) *shape[S] {
+func compileShape[S comparable](order []S, parents, initials map[S]S) *shape[S] {
 	result := &shape[S]{
-		nodes: make([]shapeNode[S], len(order)),
-		index: make(map[S]int, len(order)),
+		nodes:     make([]shapeNode[S], len(order)),
+		index:     make(map[S]int, len(order)),
+		reflexive: keycheck.ReflexiveType[S](),
 	}
 	for index, state := range order {
 		result.index[state] = index
-		result.nodes[index] = shapeNode[S]{state: state, parent: -1}
+		result.nodes[index] = shapeNode[S]{state: state, parent: -1, destination: index}
 	}
 
 	children := make([][]int, len(order))
@@ -62,22 +68,94 @@ func compileShape[S comparable](order []S, parents map[S]S) *shape[S] {
 		result.nodes[childIndex].parent = parentIndex
 		children[parentIndex] = append(children[parentIndex], childIndex)
 	}
-	clock := 0
-	var visit func(int)
-	visit = func(index int) {
-		result.nodes[index].enter = clock
-		clock++
-		for _, child := range children[index] {
-			visit(child)
-		}
-		result.nodes[index].exit = clock
-	}
+	// Preorder assigns membership intervals and depths; reversing it resolves
+	// initial chains and subtree ends after every descendant. Both passes are
+	// linear and iterative, including for a deeply nested generated chart.
+	preorder := make([]int, 0, len(order))
+	stack := make([]int, 0)
 	for index := range result.nodes {
 		if result.nodes[index].parent == -1 {
-			visit(index)
+			stack = append(stack, index)
+		}
+	}
+	for len(stack) != 0 {
+		index := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		node := &result.nodes[index]
+		node.enter = len(preorder)
+		preorder = append(preorder, index)
+		if node.parent != -1 {
+			node.depth = result.nodes[node.parent].depth + 1
+		}
+		stack = append(stack, children[index]...)
+	}
+	for cursor := len(preorder) - 1; cursor >= 0; cursor-- {
+		index := preorder[cursor]
+		node := &result.nodes[index]
+		node.exit = node.enter + 1
+		for _, child := range children[index] {
+			node.exit = max(node.exit, result.nodes[child].exit)
+		}
+		if initial, ok := initials[node.state]; ok {
+			node.destination = result.nodes[result.index[initial]].destination
 		}
 	}
 	return result
+}
+
+func (s *shape[S]) stateIndex(state S) (int, bool) {
+	if s == nil || !s.reflexive && !keycheck.Value(state) {
+		return 0, false
+	}
+	index, known := s.index[state]
+	return index, known
+}
+
+func (s *shape[S]) leastCommonAncestor(left, right int) int {
+	for s.nodes[left].depth > s.nodes[right].depth {
+		left = s.nodes[left].parent
+	}
+	for s.nodes[right].depth > s.nodes[left].depth {
+		right = s.nodes[right].parent
+	}
+	for left != right {
+		left = s.nodes[left].parent
+		right = s.nodes[right].parent
+	}
+	return left
+}
+
+// paths uses only the compiled hierarchy. Its single allocation holds both
+// lifecycle paths, with no per-transition ancestor maps or cached row products.
+func (s *shape[S]) paths(source, target, destination S, reentry bool) (exits, entries []S) {
+	from := s.index[source]
+	to := s.index[destination]
+	stop := s.index[target]
+	if reentry {
+		stop = s.nodes[stop].parent
+	} else {
+		stop = s.leastCommonAncestor(from, stop)
+	}
+	depth := -1
+	if stop != -1 {
+		depth = s.nodes[stop].depth
+	}
+	exitCount := s.nodes[from].depth - depth
+	entryCount := s.nodes[to].depth - depth
+	if exitCount+entryCount == 0 {
+		return nil, nil
+	}
+	path := make([]S, exitCount+entryCount)
+	exits, entries = path[:exitCount:exitCount], path[exitCount:]
+	for index := range exits {
+		exits[index] = s.nodes[from].state
+		from = s.nodes[from].parent
+	}
+	for index := len(entries) - 1; index >= 0; index-- {
+		entries[index] = s.nodes[to].state
+		to = s.nodes[to].parent
+	}
+	return exits, entries
 }
 
 // Position is an immutable projection of one Chart at one exact committed
@@ -89,12 +167,12 @@ type Position[S comparable] struct {
 
 // Position projects active onto c without evaluating Guards, resolving an
 // Initial, or running actions. The boolean is false when c is nil or active is
-// undeclared.
+// undeclared or an invalid key.
 func (c *Chart[S, E, T]) Position(active S) (Position[S], bool) {
 	if c == nil || c.shape == nil {
 		return Position[S]{active: -1}, false
 	}
-	index, known := c.shape.index[active]
+	index, known := c.shape.stateIndex(active)
 	if !known {
 		return Position[S]{active: -1}, false
 	}
@@ -136,12 +214,12 @@ func (p Position[S]) Path() iter.Seq[S] {
 }
 
 // Status reports whether state is inactive, encloses Active, or is Active.
-// The boolean is false when state is undeclared or p is invalid.
+// The boolean is false when state is undeclared, is an invalid key, or p is invalid.
 func (p Position[S]) Status(state S) (Status, bool) {
 	if p.shape == nil || p.active < 0 || p.active >= len(p.shape.nodes) {
 		return StatusInactive, false
 	}
-	index, known := p.shape.index[state]
+	index, known := p.shape.stateIndex(state)
 	if !known {
 		return StatusInactive, false
 	}
@@ -177,12 +255,12 @@ func (c *Chart[S, E, T]) Destination(state S) (S, bool) {
 		var zero S
 		return zero, false
 	}
-	index, known := c.shape.index[state]
+	index, known := c.shape.stateIndex(state)
 	if !known {
 		var zero S
 		return zero, false
 	}
-	return c.destination(c.shape.nodes[index].state), true
+	return c.shape.nodes[c.shape.nodes[index].destination].state, true
 }
 
 // Arrow is one statically possible transition selected from Source. Guarded
@@ -206,12 +284,14 @@ func (c *Chart[S, E, T]) Arrows(source S) iter.Seq[Arrow[S, E]] {
 		if c == nil || c.shape == nil {
 			return
 		}
-		if _, known := c.shape.index[source]; !known {
+		start, known := c.shape.stateIndex(source)
+		if !known {
 			return
 		}
 
 		seen := make(map[E]struct{})
-		for declaration := source; ; {
+		for index := start; index != -1; index = c.shape.nodes[index].parent {
+			declaration := c.shape.nodes[index].state
 			for _, event := range c.events[declaration] {
 				if _, duplicate := seen[event]; duplicate {
 					continue
@@ -221,17 +301,13 @@ func (c *Chart[S, E, T]) Arrows(source S) iter.Seq[Arrow[S, E]] {
 					return
 				}
 			}
-			parent, ok := c.parent[declaration]
-			if !ok {
-				return
-			}
-			declaration = parent
 		}
 	}
 }
 
 func (c *Chart[S, E, T]) arrowsForEvent(source S, event E, yield func(Arrow[S, E]) bool) bool {
-	for handler := source; ; {
+	for index := c.shape.index[source]; index != -1; index = c.shape.nodes[index].parent {
+		handler := c.shape.nodes[index].state
 		for _, transition := range c.rows[transitionKey[S, E]{handler, event}] {
 			destination := source
 			if transition.Kind != Internal {
@@ -248,10 +324,6 @@ func (c *Chart[S, E, T]) arrowsForEvent(source S, event E, yield func(Arrow[S, E
 				return true
 			}
 		}
-		parent, ok := c.parent[handler]
-		if !ok {
-			return true
-		}
-		handler = parent
 	}
+	return true
 }

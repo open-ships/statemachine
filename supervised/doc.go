@@ -26,7 +26,7 @@
 //
 // Every public operation returns both its detailed Result and an ordinary error
 // so errcheck-class tools can detect discarded failures. Attempt identity is
-// Execution ID plus sequence and cannot be reused across a restored Snapshot.
+// (ExecutionID, IncarnationID, Sequence); every restore has a fresh incarnation.
 //
 // Operation and verification limits are mandatory. A timeout cancels the
 // callback context, latches a Fault, and prevents logical commit. Go cannot
@@ -40,11 +40,13 @@
 // seams. A Machine that declares external Issue actions requires a Journal by
 // default; Options.Unjournaled is the explicitly named waiver for tests and
 // non-hazardous work. The Journal receives an in-doubt Snapshot before Issue
-// and a closure Snapshot after every commit, freshly latched Fault, and
-// completed recovery, so a restart can always distinguish closed work from
-// in-doubt work.
+// and attempts a closure after startup, accepted refusals, commits, fresh
+// faults, and recovery. A failed closure can leave a clean or in-doubt saved
+// Snapshot; application reconciliation is always required. Adapter ownership
+// lasts until the actual callback ends, even after a caller timeout. A busy
+// sink fails delivery immediately and no automatic retry occurs.
 //
-// Lifecycle Records are identified by (ExecutionID, Restarts, Seq), assigned
+// Lifecycle Records are identified by (ExecutionID, IncarnationID, Seq), assigned
 // atomically with the state decision each describes, bounded in memory by
 // Limits.MaxRecords, and retained across Recover. Recorder and Journal
 // failures are visible in Status and never rewrite a completed outcome.

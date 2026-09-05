@@ -12,6 +12,9 @@ var (
 	// ErrNotPermitted is statemachine.ErrNotPermitted.
 	ErrNotPermitted = statemachine.ErrNotPermitted
 
+	// ErrInvalidKey reports an unhashable or non-reflexive state or event.
+	ErrInvalidKey = statemachine.ErrInvalidKey
+
 	// ErrNilMachine reports construction from a nil Machine.
 	ErrNilMachine = errors.New("supervised: nil machine")
 	// ErrInvalidLimits reports zero or negative execution limits.
@@ -65,6 +68,8 @@ var (
 	ErrJournalRequired = errors.New("supervised: durable journal is required")
 	// ErrJournal reports failure to durably prepare an external Issue.
 	ErrJournal = errors.New("supervised: durable journal failed")
+	// ErrDeliveryBusy reports an adapter still delivering an earlier outcome.
+	ErrDeliveryBusy = errors.New("supervised: adapter delivery already in flight")
 	// ErrTripped is used when Trip receives a nil reason.
 	ErrTripped = errors.New("supervised: externally tripped")
 	// ErrViolation identifies a mandatory check that returned an error.
@@ -177,6 +182,7 @@ type Limits struct {
 // reached a controller. It is evidence for reconciliation, never authority to
 // replay or commit the Change.
 type PendingSnapshot[S, E comparable] struct {
+	StartedAt            time.Time
 	Attempt              AttemptID
 	Revision             uint64
 	From                 S
@@ -191,7 +197,7 @@ type PendingSnapshot[S, E comparable] struct {
 // writes. Restore rejects any other value with [ErrSnapshotVersion], so a
 // fielded journal can be migrated explicitly instead of being reinterpreted
 // silently.
-const SnapshotVersion uint32 = 1
+const SnapshotVersion uint32 = 2
 
 // Snapshot is the durable execution state required to restore a Supervisor. It
 // carries non-reusable execution identity and typed in-doubt Change identity;
@@ -199,11 +205,12 @@ const SnapshotVersion uint32 = 1
 // Snapshot, while an in-doubt or faulted restore requires Recover or
 // Adjudicate.
 //
-// Restarts counts prior restorations of this execution and Records is the
-// lifecycle Record sequence high-water mark when the Snapshot was taken.
-// Restore increments Restarts and resumes Record sequencing at Records, so
-// the durable Record identity (ExecutionID, Restarts, Seq) is never reused
-// across process incarnations.
+// Restarts counts saved restorations and Records is the saved sequence
+// high-water mark. Restore increments Restarts, resumes sequencing at Records,
+// and creates a fresh random IncarnationID. Record identity is therefore
+// (ExecutionID, IncarnationID, Seq), including when the same Snapshot is
+// restored repeatedly before newer counters can be saved. Random identities
+// establish uniqueness, not ordering, freshness, or exclusive writer authority.
 //
 // A Snapshot proves nothing about its own freshness: an attacker or a
 // misconfigured restore path can present a valid older Snapshot. Rollback
@@ -211,21 +218,22 @@ const SnapshotVersion uint32 = 1
 // and Restarts against independently stored high-water marks before trusting
 // a restored execution.
 type Snapshot[S, E comparable] struct {
-	Version      uint32
-	DefinitionID string
-	ExecutionID  string
-	Restarts     uint64
-	State        S
-	Revision     uint64
-	Attempt      uint64
-	Records      uint64
-	Pending      *PendingSnapshot[S, E]
-	InDoubt      bool
-	Faulted      bool
-	Uncertain    bool
-	FaultPhase   Phase
-	FaultCause   string
-	RecordedAt   time.Time
+	Version       uint32
+	DefinitionID  string
+	ExecutionID   string
+	IncarnationID string
+	Restarts      uint64
+	State         S
+	Revision      uint64
+	Attempt       uint64
+	Records       uint64
+	Pending       *PendingSnapshot[S, E]
+	InDoubt       bool
+	Faulted       bool
+	Uncertain     bool
+	FaultPhase    Phase
+	FaultCause    string
+	RecordedAt    time.Time
 }
 
 // Adjudication selects the recovery outcome for a latched Fault. The zero
@@ -275,6 +283,7 @@ type Decision[S comparable] struct {
 type Result[S, E comparable] struct {
 	DefinitionID   string
 	ExecutionID    string
+	IncarnationID  string
 	Operation      uint64
 	AttemptKey     AttemptID
 	Attempt        uint64
@@ -291,7 +300,10 @@ type Result[S, E comparable] struct {
 	Faulted        bool
 	Uncertain      bool
 	// Evidence echoes the Decision text of an Adjudicate outcome.
-	Evidence    string
+	Evidence     string
+	Adjudication Adjudication
+	// Change preserves the selected command identity independently of outcome Revision and operation timing.
+	Change      Change[S, E]
 	StartedAt   time.Time
 	CompletedAt time.Time
 	Err         error
@@ -300,14 +312,17 @@ type Result[S, E comparable] struct {
 	// at the instant this outcome was decided. It is transport for the
 	// lifecycle Record, never part of the public outcome.
 	stamp recordStamp
+	owner *activeOperation[S, E]
 }
 
 // Fault is an outward snapshot of the immutable first cause retained privately
 // by a Supervisor. Mutating this copy cannot change Supervisor state. Uncertain
 // means external physical effects may have occurred or remain in progress.
 type Fault[S, E comparable] struct {
+	Change               Change[S, E]
 	DefinitionID         string
 	ExecutionID          string
+	IncarnationID        string
 	Attempt              uint64
 	Revision             uint64
 	State                S
@@ -324,17 +339,7 @@ type Fault[S, E comparable] struct {
 }
 
 func (f *Fault[S, E]) Error() string {
-	if f == nil {
-		return "<nil>"
-	}
-	cause := f.CauseText
-	if cause == "" {
-		cause = fmt.Sprint(f.Cause)
-	}
-	return fmt.Sprintf(
-		"supervised: fault in %s phase at state %v on event %v: %s",
-		f.Phase, f.State, f.Event, cause,
-	)
+	return safeErrorText(f)
 }
 
 // Unwrap makes every Fault match ErrFaulted and its application cause.
@@ -352,10 +357,7 @@ type PanicError struct {
 }
 
 func (e *PanicError) Error() string {
-	if e == nil {
-		return "<nil>"
-	}
-	return fmt.Sprintf("supervised: callback panicked: %v", e.Value)
+	return safeErrorText(e)
 }
 
 // ViolationError preserves the mandatory check's reason.
@@ -365,10 +367,7 @@ type ViolationError struct {
 }
 
 func (e *ViolationError) Error() string {
-	if e == nil {
-		return "<nil>"
-	}
-	return fmt.Sprintf("supervised: %s: %v", e.Phase, e.Reason)
+	return safeErrorText(e)
 }
 
 func (e *ViolationError) Unwrap() []error {
@@ -383,7 +382,7 @@ type operationTimeoutError struct {
 }
 
 func (e *operationTimeoutError) Error() string {
-	return fmt.Sprintf("%v: %v", ErrOperationTimeout, e.cause)
+	return safeErrorText(e)
 }
 
 func (e *operationTimeoutError) Unwrap() []error {
@@ -397,11 +396,7 @@ type refusal[S, E comparable] struct {
 }
 
 func (r *refusal[S, E]) Error() string {
-	message := fmt.Sprintf("supervised: %v in state %v: %v", r.event, r.from, ErrNotPermitted)
-	if len(r.unwrap) > 1 {
-		message += ": " + errors.Join(r.unwrap[1:]...).Error()
-	}
-	return message
+	return safeErrorText(r)
 }
 
 func (r *refusal[S, E]) Unwrap() []error { return r.unwrap }

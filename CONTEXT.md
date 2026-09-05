@@ -53,13 +53,21 @@ _Avoid_: Runtime, safety controller
 One event accepted by a Supervisor for selection, issue, and optional verification under a single identifier.
 _Avoid_: Run, Step
 
+**Change**:
+A candidate or selected transition paired with its original Attempt identity, source, destination, revision, and start time. Lifecycle operations without a selected transition may carry a zero or operation-specific Change.
+_Avoid_: Outcome, committed revision
+
 **Operation**:
-One call to Start, Issue, Verify, or Recover together with every callback it starts. An Operation remains live until the call has returned and all detached callbacks have stopped.
+One call to Start, Issue, Verify, Recover, or Adjudicate together with every callback it starts, including Journal and Recorder delivery. An Operation remains live until the call has returned and all detached callbacks have stopped.
 _Avoid_: Attempt, Run
 
 **Execution ID**:
-A durable, non-reusable identity for one Supervisor lineage. Attempt identity is the pair of Execution ID and sequence.
+A durable, non-reusable identity for one Supervisor lineage. Attempt identity is Execution ID, Incarnation ID, and sequence.
 _Avoid_: Definition ID, Revision
+
+**Incarnation ID**:
+A fresh random identity for one construction or restoration of a Supervisor. It prevents identity reuse when the latest counters were never saved. It does not establish ordering or writer authority.
+_Avoid_: Restarts, fence
 
 **Verification**:
 One mandatory check of fresh application evidence before an issued Attempt may commit.
@@ -97,13 +105,16 @@ _Avoid_: Store, Recorder
 - A **Position** contains one active state, zero or more enclosing ancestors, and no execution registry.
 - One **Supervisor** owns exactly one committed state, zero or one pending Attempt, and zero or one latched Fault.
 - One strict Machine definition may be shared by zero or more **Supervisors**.
-- One **Attempt** issues at most one selected transition and commits it only after its verification succeeds.
+- One **Attempt** selects at most one transition for execution. Normal execution commits an external transition after verification succeeds; a purely logical transition can commit during Issue. Explicit Adjudicate can instead resolve a Fault through reconciliation.
 - One **Operation** owns a non-reusable token. A revoked Operation retains that token until its call and callbacks finish, so stale continuations cannot mutate a later Operation.
-- A restored Supervisor preserves its **Execution ID**, Attempt high-water mark, and typed in-doubt Change evidence. An in-doubt or faulted Snapshot restores Faulted and must reconcile through Recover; it is never replayed automatically.
-- An issued **Attempt** has exactly one successful **Verification**; a purely logical Attempt has none.
+- A restored Supervisor preserves its **Execution ID**, saved Attempt high-water mark, and typed in-doubt Change evidence, and generates a fresh **Incarnation ID**. Pending evidence retains its original command's Incarnation ID. An in-doubt or faulted Snapshot restores Faulted and must reconcile through Recover or Adjudicate; it is never replayed automatically.
+- An external **Attempt** committed through Verify has one successful **Verification**. An issued Attempt that faults or remains pending may have none, and AdjudicateAdopt uses explicit reconciliation instead. A purely logical Attempt has none.
 - A **Fault** is not a Machine state and does not claim that an external system reached any physical condition.
 - A configured **Journal** durably records an in-doubt Snapshot before Issue. Controller fencing and atomic plant commands remain external responsibilities.
-- Supervisor Lifecycle Records are never erased by Recover; a Recorder failure is exposed through Status.
+- Lifecycle Record identity is **Execution ID**, **Incarnation ID**, and Seq. Seq orders decisions within an incarnation; Restarts is a saved restoration count, not a uniqueness authority.
+- Recover does not reset Supervisor lifecycle history; ordinary bounded retention still applies. History retains the highest Seq values, regardless of publication order. A Recorder failure or busy delivery is exposed through Status.
+- Within one Supervisor, each Journal or Recorder admits at most one outstanding delivery and retains ownership until it ends. A shared adapter can still be called concurrently by different Supervisors. Trip and verification-expiry publication also prevent recovery until their delivery pipeline finishes.
+- For a selected Attempt and its Verify or Adopt outcome, **Change** retains the original Attempt revision and start time. A Result or Record separately reports the resulting revision, adjudication outcome, and operation timing.
 
 ## Example dialogue
 
@@ -114,4 +125,4 @@ _Avoid_: Store, Recorder
 
 - "state machine" previously meant both the immutable transition definition and a running state owner — resolved: **Machine** is the definition; **Instance** or **Runtime** owns execution state.
 - "global current status" may mean one execution's complete Position or a census across many executions. This repository provides the former and Observation deltas for building the latter; it does not own a registry of executions.
-- "confirmed" in persist means only that Store.Update returned success; physical completion in supervised execution is a **Verification**.
+- "confirmed" in persist means Store.Update returned success and passed the detectable contract checks; it does not independently prove persistence. Physical completion in supervised execution requires application evidence checked by **Verification**.

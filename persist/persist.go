@@ -35,15 +35,23 @@ var (
 	// ErrNoStore reports a nil Store or an unconfigured FuncStore.
 	ErrNoStore = errors.New("persist: store not configured")
 
-	// ErrInvalidKey reports a Store key with an uncomparable dynamic value.
-	ErrInvalidKey = errors.New("persist: key is not strictly comparable")
-	// ErrStoreContract reports that a Store called its transition callback more
-	// than once or reported success without calling it.
+	// ErrInvalidKey reports a Store key that cannot be compared safely or does
+	// not equal itself, such as a NaN-containing key.
+	ErrInvalidKey = errors.New("persist: key must be comparable and equal itself")
+	// ErrStoreContract reports a detectable violation of the Store contract.
 	ErrStoreContract = errors.New("persist: store violated the update contract")
 	// ErrStepRepeated reports a second callback invocation by one Store.Update.
 	ErrStepRepeated = errors.New("persist: store called the transition step more than once")
 	// ErrStepNotCalled reports Store.Update success without a callback invocation.
 	ErrStepNotCalled = errors.New("persist: store returned success without calling the transition step")
+	// ErrStepFailed reports Store success after its transition callback failed.
+	ErrStepFailed = errors.New("persist: store returned success after the transition step failed")
+	// ErrStepIncomplete reports that a Store returned after its callback stopped
+	// without returning, for example by swallowing a panic or runtime.Goexit.
+	ErrStepIncomplete = errors.New("persist: store returned after the transition step stopped without returning")
+	// ErrStateMismatch reports Store success with a state different from the
+	// successful transition callback's destination, or an invalid state value.
+	ErrStateMismatch = errors.New("persist: store returned a different committed state")
 )
 
 // Store owns one versioned update for an aggregate identified by K. X is the
@@ -52,7 +60,10 @@ var (
 // After loading the state, Update must call step exactly once and commit the
 // state step returns only when step succeeds. It must not retry step.
 // Fire and Step detect repeated callbacks and successful returns without a
-// callback, report [ErrStoreContract], and never execute a repeated step.
+// callback, after a failed callback, or with a different state, and callbacks
+// that stopped without returning while the Store still returned. They report
+// [ErrStoreContract] and never execute a repeated step. These checks cannot
+// verify that an adapter actually persisted its reported result.
 // Detection covers calls made before Update returns, including calls from
 // other goroutines that Update joins. A Store that violates the contract by
 // invoking step again after Update has already returned races with the
@@ -78,8 +89,9 @@ type FuncStore[K, S comparable, X any] struct {
 // From and To are meaningful only when Attempted is true. TransitionError is
 // the exact error returned by the state-owning transition execution, before
 // any later Store error.
-// Confirmed is true only when Store.Update returned success; false does not
-// prove that an external commit did not happen.
+// Confirmed is true only when Store.Update returned success and detectable
+// contract checks passed; false does not prove that an external commit did
+// not happen.
 type StepResult[S, E comparable] struct {
 	From            S
 	To              S
@@ -158,6 +170,7 @@ func apply[K, S, E comparable, T, X any](
 	}
 	var started atomic.Bool
 	var repeated atomic.Bool
+	var completed atomic.Bool
 	firstDone := make(chan struct{})
 	state, err := store.Update(ctx, key, func(ctx context.Context, from S, unit X) (S, error) {
 		if !started.CompareAndSwap(false, true) {
@@ -176,10 +189,18 @@ func apply[K, S, E comparable, T, X any](
 		to, transitionErr := execution.Fire(ctx, event, value)
 		result.To = to
 		result.TransitionError = transitionErr
+		completed.Store(true)
 		return to, transitionErr
 	})
 	if started.Load() {
 		<-firstDone
+		if !completed.Load() {
+			failure := errors.Join(ErrStoreContract, ErrStepIncomplete, err)
+			if repeated.Load() {
+				failure = errors.Join(failure, ErrStepRepeated)
+			}
+			return state, result, failure
+		}
 	}
 	if repeated.Load() {
 		result.Confirmed = false
@@ -189,6 +210,12 @@ func apply[K, S, E comparable, T, X any](
 		return state, result, errors.Join(ErrStoreContract, ErrStepNotCalled)
 	}
 	if err == nil && started.Load() {
+		if result.TransitionError != nil {
+			return state, result, errors.Join(ErrStoreContract, ErrStepFailed, result.TransitionError)
+		}
+		if !keycheck.Value(state) || state != result.To {
+			return state, result, errors.Join(ErrStoreContract, ErrStateMismatch)
+		}
 		result.Confirmed = true
 	}
 	return state, result, err

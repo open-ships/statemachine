@@ -31,8 +31,8 @@ import (
 var (
 	ErrNotPermitted = errors.New("transition not permitted")
 	// ErrInvalidKey reports a state or event value that cannot safely be used
-	// as a map key because it contains an uncomparable dynamic value.
-	ErrInvalidKey = errors.New("statemachine: state or event is not strictly comparable")
+	// as a map key because it is uncomparable or unequal to itself, as with NaN.
+	ErrInvalidKey = errors.New("statemachine: state or event is not a comparable, reflexive key")
 )
 
 // A Transition is one row of a transition table: in state From, event Event
@@ -109,20 +109,19 @@ type key[S, E comparable] struct {
 // every event.
 //
 // S and E must be strictly comparable. Go's comparable constraint also admits
-// interface-bearing types; Compile rejects them before building any map. A
-// zero Machine reports [ErrInvalidKey] from Next for an uncomparable dynamic
-// value, while Permitted returns an empty sequence. Prefer distinct defined
-// string or integer types for S and E.
+// interface-bearing types; Compile rejects them before building any map.
+// Values must also equal themselves: Compile rejects NaN-bearing keys with
+// [ErrInvalidKey]. Next reports ErrInvalidKey for invalid runtime values,
+// while Permitted returns an empty sequence. Prefer distinct defined string
+// or integer types for S and E.
 type Machine[S, E comparable, T any] struct {
 	rows   map[key[S, E]][]Transition[S, E, T]
 	events map[S][]E // per state, each event once, in first-mention order
 
-	// strict records that Compile proved S and E free of interface-bearing
-	// types, so no dynamic value of either can be an uncomparable map key.
-	// Strictness is a property of the type: once proved at compile time, the
-	// per-value reflection check in Next and Permitted is unnecessary. The
-	// zero Machine has not been through Compile and keeps the per-value check.
-	strict bool
+	// Reflexive types need no per-value validation on the execution path.
+	// Float/complex types and the zero Machine retain the value checks.
+	reflexiveState bool
+	reflexiveEvent bool
 }
 
 // Compile builds a [Machine] from a transition table. It copies transitions, so
@@ -132,10 +131,10 @@ type Machine[S, E comparable, T any] struct {
 // runs after package-level variable initialization — are not in the Machine.
 // Build the table in one expression.
 //
-// Compile reports an error for the one defect a table can have that this
-// package can detect: a row that can never be selected, because an earlier row
-// with the same From and Event has no Guard. Everything else is legal — an
-// empty table, a state with no outgoing row (a terminal state), and a state
+// Compile rejects interface-bearing key types, non-reflexive key values, and
+// rows that can never be selected because an earlier row with the same From
+// and Event has no Guard. It permits an empty table, a state with no outgoing
+// row (a terminal state), and a state
 // named only by To, since this package is never told where a run begins and so
 // cannot tell an unreachable state from a state you enter another way.
 //
@@ -152,14 +151,19 @@ func Compile[S, E comparable, T any](transitions []Transition[S, E, T]) (*Machin
 		return nil, errors.New("statemachine: event type must not contain an interface")
 	}
 	m := &Machine[S, E, T]{
-		rows:   make(map[key[S, E]][]Transition[S, E, T], len(transitions)),
-		events: make(map[S][]E),
-		strict: true,
+		rows:           make(map[key[S, E]][]Transition[S, E, T], len(transitions)),
+		events:         make(map[S][]E),
+		reflexiveState: keycheck.ReflexiveType[S](),
+		reflexiveEvent: keycheck.ReflexiveType[E](),
 	}
 	// Once a group has an unguarded row, every later row in that group is dead.
 	unguarded := make(map[key[S, E]]int, len(transitions))
 
 	for i, t := range transitions {
+		if !m.reflexiveState && (!keycheck.Value(t.From) || !keycheck.Value(t.To)) ||
+			!m.reflexiveEvent && !keycheck.Value(t.Event) {
+			return nil, fmt.Errorf("statemachine: transitions[%d]: %w", i, ErrInvalidKey)
+		}
 		k := key[S, E]{t.From, t.Event}
 		if j, dead := unguarded[k]; dead {
 			return nil, fmt.Errorf(
@@ -249,7 +253,7 @@ func (m *Machine[S, E, T]) selectTransition(
 	event E,
 	data T,
 ) (*Transition[S, E, T], error) {
-	if !m.strict && (!keycheck.Value(from) || !keycheck.Value(event)) {
+	if !m.reflexiveState && !keycheck.Value(from) || !m.reflexiveEvent && !keycheck.Value(event) {
 		return nil, ErrInvalidKey
 	}
 	var reasons []error
@@ -290,7 +294,7 @@ func (m *Machine[S, E, T]) selectTransition(
 // [ErrNotPermitted] cannot go stale between the question and the answer.
 func (m *Machine[S, E, T]) Permitted(ctx context.Context, from S, data T) iter.Seq2[E, S] {
 	return func(yield func(E, S) bool) {
-		if !m.strict && !keycheck.Value(from) {
+		if !m.reflexiveState && !keycheck.Value(from) {
 			return
 		}
 		for _, event := range m.events[from] {

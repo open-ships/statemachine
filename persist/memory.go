@@ -47,12 +47,27 @@ type MemoryStore[K, S comparable] struct {
 }
 
 // NewMemoryStore copies initial into a new MemoryStore at revision zero.
+// It panics with ErrInvalidKey if an initial key is not equal to itself.
+// Use NewMemoryStoreChecked when initial keys require validation.
 func NewMemoryStore[K, S comparable](initial map[K]S) *MemoryStore[K, S] {
+	store, err := NewMemoryStoreChecked(initial)
+	if err != nil {
+		panic(err)
+	}
+	return store
+}
+
+// NewMemoryStoreChecked is like NewMemoryStore but reports invalid initial
+// keys as ErrInvalidKey. No partially populated Store is returned on error.
+func NewMemoryStoreChecked[K, S comparable](initial map[K]S) (*MemoryStore[K, S], error) {
 	entries := make(map[K]Snapshot[S], len(initial))
 	for key, state := range initial {
+		if !keycheck.Value(key) {
+			return nil, ErrInvalidKey
+		}
 		entries[key] = Snapshot[S]{State: state}
 	}
-	return &MemoryStore[K, S]{entries: entries}
+	return &MemoryStore[K, S]{entries: entries}, nil
 }
 
 // Load returns the current committed snapshot for key.

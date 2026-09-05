@@ -170,3 +170,97 @@ func TestCombinedObserversPanicWhenInvokedDirectly(t *testing.T) {
 	}()
 	combined(context.Background(), statemachine.Observation[obsState, obsEvent]{Seq: 1}, 0)
 }
+
+func TestTimeoutObserverPassesAndCancelsDerivedContext(t *testing.T) {
+	type requestKey struct{}
+	parent := context.WithValue(context.Background(), requestKey{}, "request")
+	var received []context.Context
+	observer := statemachine.TimeoutObserver(func(ctx context.Context, _ statemachine.Observation[obsState, obsEvent], _ int) {
+		received = append(received, ctx)
+	}, time.Second)
+	instance := statemachine.NewInstanceWithObservers(observerTable(), obsIdle, observer)
+	before := time.Now()
+	if _, err := instance.Fire(parent, obsGo, 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(received) != 2 {
+		t.Fatalf("received %d contexts, want 2", len(received))
+	}
+	for _, ctx := range received {
+		deadline, ok := ctx.Deadline()
+		if !ok || deadline.Before(before) || deadline.After(time.Now().Add(time.Second)) || ctx.Value(requestKey{}) != "request" {
+			t.Fatalf("derived context = deadline %v (%v), value %v", deadline, ok, ctx.Value(requestKey{}))
+		}
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("context after completed delivery = %v", ctx.Err())
+		}
+	}
+	if parent.Err() != nil {
+		t.Fatalf("observer canceled request context: %v", parent.Err())
+	}
+}
+
+func TestTimeoutObserverPreservesEarlierCancellation(t *testing.T) {
+	parent, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	wantDeadline, _ := parent.Deadline()
+	cancel()
+	var received context.Context
+	observer := statemachine.TimeoutObserver(func(ctx context.Context, _ statemachine.Observation[obsState, obsEvent], _ int) {
+		received = ctx
+	}, time.Hour)
+	observer(parent, statemachine.Observation[obsState, obsEvent]{Seq: 1}, 0)
+	if received == nil {
+		t.Fatal("canceled request skipped observer")
+	}
+	deadline, ok := received.Deadline()
+	if !ok || !deadline.Equal(wantDeadline) || !errors.Is(received.Err(), context.Canceled) {
+		t.Fatalf("derived context = deadline %v (%v), error %v", deadline, ok, received.Err())
+	}
+}
+
+func TestTimeoutObserverCancelsAbandonedCallbacks(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	contexts := make(chan context.Context, 2)
+	finished := make(chan struct{}, 2)
+	observer := statemachine.TimeoutObserver(func(ctx context.Context, _ statemachine.Observation[obsState, obsEvent], _ int) {
+		defer func() { finished <- struct{}{} }()
+		contexts <- ctx
+		<-release
+	}, 10*time.Millisecond)
+	instance := statemachine.NewInstanceWithObservers(observerTable(), obsIdle, observer)
+	if state, err := instance.Fire(context.Background(), obsGo, 0); state != obsRunning || !errors.Is(err, statemachine.ErrObserverTimeout) {
+		t.Fatalf("Fire = %v, %v", state, err)
+	}
+	for range 2 {
+		select {
+		case ctx := <-contexts:
+			if _, ok := ctx.Deadline(); !ok || ctx.Err() == nil {
+				t.Fatalf("abandoned context = deadline %v, error %v", ok, ctx.Err())
+			}
+		case <-time.After(time.Second):
+			t.Fatal("observer never started")
+		}
+	}
+	// Both callbacks have started while the first remains live. This is why a
+	// timeout wrapper requires concurrency-safe observers even on one Instance.
+	select {
+	case <-finished:
+		t.Fatal("blocked callback unexpectedly returned")
+	default:
+	}
+}
+
+func TestTimeoutObserverBoundsContainedReporter(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	panicking := func(context.Context, statemachine.Observation[obsState, obsEvent], int) { panic("sink") }
+	observer := statemachine.TimeoutObserver(statemachine.ContainedObserver(panicking, func(error) {
+		<-release
+	}), 10*time.Millisecond)
+	instance := statemachine.NewInstanceWithObservers(observerTable(), obsIdle, observer)
+	if state, err := instance.Fire(context.Background(), obsGo, 0); state != obsRunning || !errors.Is(err, statemachine.ErrObserverTimeout) {
+		t.Fatalf("Fire with blocked reporter = %v, %v", state, err)
+	}
+}

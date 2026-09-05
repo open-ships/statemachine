@@ -3,6 +3,7 @@ package statemachine_test
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -219,6 +220,29 @@ func FuzzZeroAndCompiledKeyChecks(f *testing.F) {
 		got, err = compiled.Next(context.Background(), state, event, 0)
 		if got != state || !errors.Is(err, statemachine.ErrNotPermitted) {
 			t.Fatalf("empty compiled Machine Next = %v, %v", got, err)
+		}
+	})
+}
+
+// Floating key values are classified independently from map lookup behavior.
+func FuzzFloatingMachineKeys(f *testing.F) {
+	f.Add(uint64(0), uint64(0), uint64(0x3ff0000000000000))
+	f.Add(uint64(0), uint64(0x7ff8000000000001), uint64(0))
+	f.Fuzz(func(t *testing.T, fromBits, eventBits, toBits uint64) {
+		from, event, to := math.Float64frombits(fromBits), math.Float64frombits(eventBits), math.Float64frombits(toBits)
+		machine, err := statemachine.Compile([]statemachine.Transition[float64, float64, struct{}]{{From: from, Event: event, To: to}})
+		if math.IsNaN(from) || math.IsNaN(event) || math.IsNaN(to) {
+			if !errors.Is(err, statemachine.ErrInvalidKey) {
+				t.Fatalf("Compile = %v, want ErrInvalidKey", err)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := machine.Next(context.Background(), from, event, struct{}{})
+		if got != to || err != nil {
+			t.Fatalf("Next = %v, %v; want %v", got, err, to)
 		}
 	})
 }

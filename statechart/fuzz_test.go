@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/open-ships/statemachine"
@@ -253,7 +254,73 @@ func decodeModel(shape []byte) (*scModel, statechart.Definition[scState, scEvent
 		model.rows = append(model.rows, modelRow)
 		definition.Transitions = append(definition.Transitions, transition)
 	}
+	// Declaration order is independent of hierarchy order. Reversing these
+	// inputs exercises children declared before parents and initials whose
+	// destination has not yet appeared in the state slice.
+	if shape[0]&0x80 != 0 {
+		slices.Reverse(definition.States)
+		slices.Reverse(definition.Substates)
+		slices.Reverse(definition.Initials)
+	}
 	return model, definition, true
+}
+
+// Membership is derived directly from the declared parent relationships,
+// independently of the compiled intervals and transition lifecycle paths.
+func assertModelPosition(t *testing.T, model *scModel, position statechart.Position[scState], active scState) {
+	t.Helper()
+	if got, ok := position.Active(); !ok || got != active {
+		t.Fatalf("Position.Active = %v/%v, want %v", got, ok, active)
+	}
+	lineage := model.ancestors(active)
+	if got := slices.Collect(position.Path()); !slices.Equal(got, lineage) {
+		t.Fatalf("Position.Path = %v, want %v", got, lineage)
+	}
+	for state := scState(0); int(state) < model.stateCount; state++ {
+		want := statechart.StatusInactive
+		if state == active {
+			want = statechart.StatusActive
+		} else if slices.Contains(lineage, state) {
+			want = statechart.StatusEnclosing
+		}
+		if got, known := position.Status(state); !known || got != want {
+			t.Fatalf("Position.Status(%v) = %v/%v, want %v", state, got, known, want)
+		}
+	}
+}
+
+func assertObservationMembership(t *testing.T, model *scModel, from, to scState, observations []statechart.Observation[scState, scEvent]) {
+	t.Helper()
+	membership := make(map[scState]int)
+	for _, state := range model.ancestors(from) {
+		membership[state] = 1
+	}
+	for _, observation := range observations {
+		switch observation.Move {
+		case statemachine.Exited:
+			if membership[observation.State] != 1 {
+				t.Fatalf("exited inactive state %v", observation.State)
+			}
+			membership[observation.State]--
+		case statemachine.Entered:
+			if membership[observation.State] != 0 {
+				t.Fatalf("entered already active state %v", observation.State)
+			}
+			membership[observation.State]++
+		default:
+			t.Fatalf("invalid observation Move %v", observation.Move)
+		}
+	}
+	lineage := model.ancestors(to)
+	for state := scState(0); int(state) < model.stateCount; state++ {
+		want := 0
+		if slices.Contains(lineage, state) {
+			want = 1
+		}
+		if membership[state] != want {
+			t.Fatalf("observation deltas left membership[%v] = %d, want %d", state, membership[state], want)
+		}
+	}
 }
 
 // FuzzStatechartCompile feeds arbitrary — including invalid — definitions to
@@ -356,7 +423,10 @@ func FuzzStatechartFire(f *testing.F) {
 			event := scEvent(eventByte % 3)
 			trace := &[]lifecycleStep{}
 			observations = observations[:0]
+			before, _ := instance.Position()
+			assertModelPosition(t, model, before, active)
 			state, err := instance.Fire(context.Background(), event, trace)
+			assertModelPosition(t, model, before, active) // saved snapshots stay valid
 
 			row, handler, declined, selected := model.selectRow(active, event)
 			if !selected {
@@ -429,7 +499,96 @@ func FuzzStatechartFire(f *testing.F) {
 			if total != 0 {
 				nextSeq += uint64(total)
 			}
+			assertObservationMembership(t, model, active, destination, observations)
+			after, _ := instance.Position()
+			assertModelPosition(t, model, after, destination)
 			active = destination
+		}
+	})
+}
+
+// Failures are injected at an arbitrary callback in each event. Successful
+// callbacks may have effects, but failure must preserve Position and emit no
+// observations, and ActionError must identify only completed nonnil callbacks.
+func FuzzStatechartFailureCommit(f *testing.F) {
+	f.Add([]byte{0, 0, 0, 0, 0, 0, 0, 0}, []byte{0, 1}, uint8(0))
+	f.Add([]byte{0, 0, 0, 0, 0, 0, 0, 0}, []byte{0, 1}, uint8(1))
+	f.Add([]byte{0, 0, 0, 0, 0, 0, 0, 0}, []byte{0, 1}, uint8(2))
+	f.Add([]byte{130, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0}, []byte{0, 1, 2}, uint8(3))
+	f.Fuzz(func(t *testing.T, shape, events []byte, failureByte uint8) {
+		shape = shape[:min(len(shape), 64)]
+		events = events[:min(len(events), 32)]
+		model, definition, ok := decodeModel(shape)
+		if !ok {
+			return
+		}
+		sentinel := errors.New("injected lifecycle failure")
+		calls, failureAt := 0, int(failureByte%16)
+		completed := map[statechart.Phase]int{}
+		var expected *statechart.ActionError
+		wrap := func(original statechart.Action[scState, scEvent, *[]lifecycleStep], phase statechart.Phase, state any, index int) statechart.Action[scState, scEvent, *[]lifecycleStep] {
+			return func(ctx context.Context, info statechart.Info[scState, scEvent], trace *[]lifecycleStep) error {
+				call := calls
+				calls++
+				if call == failureAt {
+					expected = &statechart.ActionError{Phase: phase, State: state, ActionIndex: index, Completed: completed[phase], Err: sentinel}
+					return sentinel
+				}
+				if original != nil {
+					if err := original(ctx, info, trace); err != nil {
+						return err
+					}
+				}
+				completed[phase]++
+				return nil
+			}
+		}
+		for index := range definition.States {
+			node := &definition.States[index]
+			node.Entry = []statechart.Action[scState, scEvent, *[]lifecycleStep]{nil, wrap(node.Entry[0], statechart.PhaseEntry, node.Name, 1), nil}
+			node.Exit = []statechart.Action[scState, scEvent, *[]lifecycleStep]{nil, wrap(node.Exit[0], statechart.PhaseExit, node.Name, 1), nil}
+		}
+		for index := range definition.Transitions {
+			definition.Transitions[index].Do = wrap(nil, statechart.PhaseEffect, nil, 0)
+		}
+		chart, err := statechart.Compile(definition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var observations []statechart.Observation[scState, scEvent]
+		instance, err := chart.NewWithObservers(scState(failureByte%uint8(model.stateCount)), func(_ context.Context, observation statechart.Observation[scState, scEvent], _ *[]lifecycleStep) {
+			observations = append(observations, observation)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, eventByte := range events {
+			calls = 0
+			clear(completed)
+			expected = nil
+			observations = observations[:0]
+			source := instance.State()
+			before, _ := instance.Position()
+			trace := &[]lifecycleStep{}
+			destination, err := instance.Fire(context.Background(), scEvent(eventByte%3), trace)
+			assertModelPosition(t, model, before, source)
+			if expected != nil {
+				var actual *statechart.ActionError
+				if !errors.As(err, &actual) || !errors.Is(err, sentinel) {
+					t.Fatalf("failure result: %v", err)
+				}
+				if actual.Phase != expected.Phase || actual.State != expected.State || actual.ActionIndex != expected.ActionIndex || actual.Completed != expected.Completed || actual.Committed {
+					t.Fatalf("ActionError = %+v, want %+v", actual, expected)
+				}
+				if destination != source || len(observations) != 0 {
+					t.Fatalf("failed callback committed %v -> %v / %+v", source, destination, observations)
+				}
+			} else if err != nil && !errors.Is(err, statechart.ErrNotPermitted) {
+				t.Fatal(err)
+			}
+			after, _ := instance.Position()
+			assertModelPosition(t, model, after, destination)
+			assertObservationMembership(t, model, source, destination, observations)
 		}
 	})
 }

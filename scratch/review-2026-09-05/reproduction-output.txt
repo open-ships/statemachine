@@ -1,0 +1,46 @@
+=== RUN   TestReviewNaNEventAndDestinationAreAcceptedButUnselectable
+    review_edge_repro_test.go:45: Compile accepts NaN events/destinations; lookup cannot select the corresponding rows
+--- PASS: TestReviewNaNEventAndDestinationAreAcceptedButUnselectable (0.00s)
+=== RUN   TestReviewNaNMemoryStoreKeyCannotLoad
+    review_edge_repro_test.go:54: MemoryStore accepts initial NaN key, then cannot load it
+--- PASS: TestReviewNaNMemoryStoreKeyCannotLoad (0.00s)
+=== RUN   TestReviewZeroStatechartPanicsOnDynamicUnhashableEvent
+    review_edge_repro_test.go:62: zero Statechart Instance panics: hash of unhashable type: []int
+--- PASS: TestReviewZeroStatechartPanicsOnDynamicUnhashableEvent (0.00s)
+=== RUN   TestReviewStatechartCountsNilLifecycleActionAsCompleted
+    review_edge_repro_test.go:92: Completed=1 although no nonnil lifecycle action returned successfully
+--- PASS: TestReviewStatechartCountsNilLifecycleActionAsCompleted (0.00s)
+PASS
+ok  	github.com/open-ships/statemachine	1.406s
+=== RUN   TestReviewLateClosureOverwritesNewPreparation
+    review_repro_test.go:92: older clean closure erased in-doubt second attempt; restore accepted clean snapshot and reused attempt {ExecutionID:e43bfaee6e3869620788a039523a9dfd Sequence:2}
+--- PASS: TestReviewLateClosureOverwritesNewPreparation (0.01s)
+=== RUN   TestReviewRecordCounterWrapsOnValidRestore
+    review_repro_test.go:107: valid restored record high-water MaxUint64 wraps to zero
+--- PASS: TestReviewRecordCounterWrapsOnValidRestore (0.00s)
+=== RUN   TestReviewCleanRestartsReuseDurableRecordIdentity
+    review_repro_test.go:153: repeated clean restarts durably deliver identical identity (1a0f91448b472c8f4d86f4c69ab520a6,1,4)
+--- PASS: TestReviewCleanRestartsReuseDurableRecordIdentity (0.00s)
+=== RUN   TestReviewAdoptSelfTransitionSkipsRevision
+    review_repro_test.go:179: adoption returns Committed=false Revision=0; normal Verify of this row increments Revision
+--- PASS: TestReviewAdoptSelfTransitionSkipsRevision (0.00s)
+=== RUN   TestReviewRecordChangesLoseOriginalAttemptMetadata
+    review_repro_test.go:205: Verify receives attempt revision 0 started 2026-09-05 09:35:53.275464 -0400 EDT m=+0.009639376; Record.Change carries revision 1 started 2026-09-05 09:35:53.275521 -0400 EDT m=+0.009696459
+--- PASS: TestReviewRecordChangesLoseOriginalAttemptMetadata (0.00s)
+=== RUN   TestReviewRecoverRunsWhilePriorPublicIssueAndRecorderAreLive
+    review_repro_test.go:274: Recover reconciler ran while prior public Issue and its cooperative Recorder callback were still live; Status claimed no operation/callback
+--- PASS: TestReviewRecoverRunsWhilePriorPublicIssueAndRecorderAreLive (0.00s)
+=== RUN   TestReviewRecorderReentryNecessarilyTimesOut
+    review_repro_test.go:301: otherwise immediately returning Recorder calls public Trip, causing guaranteed self-wait and RecorderFailures=1 (context deadline exceeded)
+--- PASS: TestReviewRecorderReentryNecessarilyTimesOut (0.01s)
+=== RUN   TestReviewTripWaitIsProportionalToConcurrentRecordBacklog
+    review_repro_test.go:335: Trip took 153.074375ms with RecorderTimeout=20ms and six concurrent refused calls; documented approximate two-interval bound=40ms
+--- PASS: TestReviewTripWaitIsProportionalToConcurrentRecordBacklog (0.15s)
+=== RUN   TestReviewCausalRingEvictsNewTripForOlderResult
+    review_repro_test.go:378: ring retained older Seq=1 Kind=issue, evicting newer Trip Seq=2; high-water=2
+--- PASS: TestReviewCausalRingEvictsNewTripForOlderResult (0.00s)
+=== RUN   TestReviewRefusedAcceptedAttemptIsReusedAfterRestore
+    review_repro_test.go:430: new issued AttemptKey {ExecutionID:c1b6ce74b4d386d6c5c5a5a6dc7b0940 Sequence:2} equals accepted-but-refused pre-crash AttemptKey; latest durable Attempt=1
+--- PASS: TestReviewRefusedAcceptedAttemptIsReusedAfterRestore (0.00s)
+PASS
+ok  	github.com/open-ships/statemachine/supervised	1.617s

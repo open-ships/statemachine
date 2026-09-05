@@ -53,7 +53,7 @@ func TestConstructionRequiresJournalForExternalMachines(t *testing.T) {
 		t.Fatalf("NewWithClock external = %v", err)
 	}
 	snapshot := Snapshot[testState, testEvent]{
-		Version: SnapshotVersion, DefinitionID: external.ID(), ExecutionID: "execution", State: testIdle,
+		Version: SnapshotVersion, DefinitionID: external.ID(), ExecutionID: "execution", IncarnationID: "stored-incarnation", State: testIdle,
 	}
 	if _, err := Restore(external, snapshot, limits()); !errors.Is(err, ErrJournalRequired) {
 		t.Fatalf("Restore external = %v", err)
@@ -83,7 +83,7 @@ func TestRestoreValidatesSnapshotSchemaVersion(t *testing.T) {
 	machine := MustCompile(validDefinition())
 	for _, version := range []uint32{0, SnapshotVersion + 1} {
 		snapshot := Snapshot[testState, testEvent]{
-			Version: version, DefinitionID: machine.ID(), ExecutionID: "execution", State: testIdle,
+			Version: version, DefinitionID: machine.ID(), ExecutionID: "execution", IncarnationID: "stored-incarnation", State: testIdle,
 		}
 		if _, err := restoreUnjournaled(machine, snapshot, limits()); !errors.Is(err, ErrSnapshotVersion) {
 			t.Fatalf("Restore version %d = %v", version, err)
@@ -150,10 +150,10 @@ func TestJournalReceivesPrepareAndClosureInDecisionOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	writes := log.all()
-	if len(writes) != 2 {
+	if len(writes) != 3 {
 		t.Fatalf("journal writes = %+v", writes)
 	}
-	prepare, closure := writes[0], writes[1]
+	prepare, closure := writes[1], writes[2]
 	if !prepare.InDoubt || prepare.Pending == nil || prepare.Revision != 0 {
 		t.Fatalf("prepare = %+v", prepare)
 	}
@@ -167,14 +167,14 @@ func TestJournalReceivesPrepareAndClosureInDecisionOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	writes = log.all()
-	if len(writes) != 4 {
+	if len(writes) != 5 {
 		t.Fatalf("journal writes after trip/recover = %+v", writes)
 	}
-	if !writes[2].Faulted || writes[2].FaultCause == "" {
-		t.Fatalf("trip closure = %+v", writes[2])
+	if !writes[3].Faulted || writes[3].FaultCause == "" {
+		t.Fatalf("trip closure = %+v", writes[3])
 	}
-	if writes[3].Faulted || writes[3].State != testRunning {
-		t.Fatalf("recovery closure = %+v", writes[3])
+	if writes[4].Faulted || writes[4].State != testRunning {
+		t.Fatalf("recovery closure = %+v", writes[4])
 	}
 }
 

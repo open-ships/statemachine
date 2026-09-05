@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   test:
     strategy:
@@ -15,87 +18,90 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Go
+      - name: Set up supported Go patch release
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.0"
+          go-version: "1.26.8"
+          cache-dependency-path: |
+            go.mod
+            integration/sqlite/go.sum
 
-      - name: Vet
-        run: go vet ./...
+      - name: Platform tests
+        if: runner.os != 'Linux'
+        shell: bash
+        run: ./scripts/check.sh test
 
-      - name: Static analysis
-        if: runner.os == 'Linux'
-        run: |
-          go run github.com/kisielk/errcheck@v1.20.0 ./...
-          go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
-
-      - name: Test
-        run: go test ./...
-
-      # The remaining checks are properties of the source, not of the platform,
-      # so one runner proves them. They also assume a POSIX shell.
-      - name: Verify zero dependencies
-        if: runner.os == 'Linux'
-        run: |
-          test ! -f go.sum || (echo "go.sum exists; this module must have zero dependencies" && exit 1)
-
-      - name: Formatting
-        if: runner.os == 'Linux'
-        run: test -z "$(gofmt -l .)"
-
-      - name: Race detector
-        if: runner.os == 'Linux'
-        run: go test -race -coverprofile=coverage.out ./...
-
-      - name: Enforce coverage floor
+      - name: Source assurance and SQLite integration
         if: runner.os == 'Linux'
         shell: bash
-        run: |
-          COVERAGE=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
-          awk -v coverage="$COVERAGE" 'BEGIN { if (coverage < 90) exit 1 }'
+        run: ./scripts/check.sh
 
       - name: Retain coverage evidence
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-${{ github.sha }}
           path: coverage.out
+          if-no-files-found: ignore
 
-      - name: Vulnerability scan
+      - name: Repeated benchmarks
         if: runner.os == 'Linux'
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+        run: ./scripts/benchmark.sh
 
-      - name: Benchmarks
-        if: runner.os == 'Linux'
-        run: go test -run=NONE -bench=. -benchtime=10x ./...
+      - name: Retain benchmark evidence
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmarks-${{ github.sha }}
+          path: benchmark.out
+          if-no-files-found: ignore
 
-  # Every fuzz target gets a short live run per change, beyond the seed
-  # executions that already happen inside `go test`. The sustained campaign
-  # runs on a schedule in fuzz.yml.
+  toolchain-compatibility:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - go: "1.26.0"
+            purpose: minimum
+          - go: "1.27.1"
+            purpose: current
+    name: Go ${{ matrix.go }} (${{ matrix.purpose }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up compatibility toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: go.mod
+      - name: Root-module language and toolchain compatibility
+        run: ./scripts/check.sh test
+
+  # Per-change live coverage supplements ordinary seed execution. The sustained
+  # campaign in fuzz.yml has the same discovery and failure-retention policy.
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.0"
-
+          go-version: "1.26.8"
+          cache-dependency-path: go.mod
       - name: Fuzz every target briefly
-        shell: bash
-        run: |
-          set -euo pipefail
-          for pkg in $(go list ./...); do
-            for target in $(go test -list '^Fuzz' "$pkg" | grep '^Fuzz' || true); do
-              echo "::group::$pkg $target"
-              go test -run '^$' -fuzz "^${target}\$" -fuzztime 20s "$pkg"
-              echo "::endgroup::"
-            done
-          done
+        env:
+          FUZZTIME: 20s
+        run: ./scripts/fuzz.sh
+      - name: Retain failing inputs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-smoke-failures-${{ github.sha }}
+          path: '**/testdata/fuzz/**'
+          if-no-files-found: ignore
