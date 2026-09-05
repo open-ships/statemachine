@@ -10,6 +10,31 @@ func StrictType[T comparable]() bool {
 	return strict(reflect.TypeFor[T]())
 }
 
+// ReflexiveType reports whether every value of T is a safe, reflexive map key.
+// Floating-point and complex values can contain NaN; interfaces can contain
+// either NaN or uncomparable values. Pointers compare by identity, regardless
+// of the type or contents of the value they point to.
+func ReflexiveType[T comparable]() bool {
+	return reflexive(reflect.TypeFor[T]())
+}
+
+func reflexive(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Interface, reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
+		return false
+	case reflect.Array:
+		return t.Len() == 0 || reflexive(t.Elem())
+	case reflect.Struct:
+		for index := 0; index < t.NumField(); index++ {
+			field := t.Field(index)
+			if field.Name != "_" && !reflexive(field.Type) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func strict(t reflect.Type) bool {
 	switch t.Kind() {
 	case reflect.Interface:
@@ -26,9 +51,10 @@ func strict(t reflect.Type) bool {
 	return true
 }
 
-// Value reports whether value's current dynamic representation is comparable.
-// It is useful at interfaces that cannot reject an unsafe generic type during
-// construction, such as the zero Machine and Store adapters.
+// Value reports whether value is comparable and equal to itself. A NaN-bearing
+// key can be inserted into a Go map but can never be retrieved, so comparability
+// alone is insufficient. The comparability check must precede equality because
+// interface-bearing values can otherwise panic during the comparison.
 func Value[T comparable](value T) bool {
-	return reflect.ValueOf(&value).Elem().Comparable()
+	return reflect.ValueOf(&value).Elem().Comparable() && value == value
 }

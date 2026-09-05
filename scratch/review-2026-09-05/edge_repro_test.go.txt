@@ -1,0 +1,93 @@
+package statemachine_test
+
+import (
+	"context"
+	"errors"
+	"math"
+	"testing"
+
+	"github.com/open-ships/statemachine"
+	"github.com/open-ships/statemachine/persist"
+	"github.com/open-ships/statemachine/statechart"
+)
+
+// These probes intentionally assert the defects observed in commit 9538650.
+// Passing means the defect is reproduced. They are not proposed regression tests.
+
+func TestReviewNaNEventAndDestinationAreAcceptedButUnselectable(t *testing.T) {
+	ctx := context.Background()
+	nan := math.NaN()
+	m, err := statemachine.Compile([]statemachine.Transition[int, float64, struct{}]{
+		{From: 0, Event: nan, To: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.Next(ctx, 0, nan, struct{}{}); !errors.Is(err, statemachine.ErrNotPermitted) {
+		t.Fatalf("expected unselectable accepted NaN event: %v", err)
+	}
+	for range m.Permitted(ctx, 0, struct{}{}) {
+		t.Fatal("expected NaN event absent from permitted choices")
+	}
+	m2, err := statemachine.Compile([]statemachine.Transition[float64, int, struct{}]{
+		{From: 0, Event: 1, To: nan}, {From: nan, Event: 2, To: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := statemachine.NewInstance(m2, 0)
+	if state, err := i.Fire(ctx, 1, struct{}{}); err != nil || !math.IsNaN(state) {
+		t.Fatalf("expected accepted NaN destination: %v, %v", state, err)
+	}
+	if _, err := i.Fire(ctx, 2, struct{}{}); !errors.Is(err, statemachine.ErrNotPermitted) {
+		t.Fatalf("expected declared NaN-source row to be unselectable: %v", err)
+	}
+	t.Log("Compile accepts NaN events/destinations; lookup cannot select the corresponding rows")
+}
+
+func TestReviewNaNMemoryStoreKeyCannotLoad(t *testing.T) {
+	nan := math.NaN()
+	store := persist.NewMemoryStore(map[float64]int{nan: 1})
+	if _, err := store.Load(context.Background(), nan); !errors.Is(err, persist.ErrNotFound) {
+		t.Fatalf("expected unreadable accepted NaN key: %v", err)
+	}
+	t.Log("MemoryStore accepts initial NaN key, then cannot load it")
+}
+
+func TestReviewZeroStatechartPanicsOnDynamicUnhashableEvent(t *testing.T) {
+	defer func() {
+		if failure := recover(); failure == nil {
+			t.Error("expected reproduced zero-instance panic")
+		} else {
+			t.Logf("zero Statechart Instance panics: %v", failure)
+		}
+	}()
+	var i statechart.Instance[any, any, struct{}]
+	_, _ = i.Fire(context.Background(), []int{1}, struct{}{})
+}
+
+func TestReviewStatechartCountsNilLifecycleActionAsCompleted(t *testing.T) {
+	failure := errors.New("exit failed")
+	chart := statechart.MustCompile(statechart.Definition[int, int, struct{}]{
+		States: []statechart.State[int, int, struct{}]{
+			{Name: 0, Exit: []statechart.Action[int, int, struct{}]{
+				nil,
+				func(context.Context, statechart.Info[int, int], struct{}) error { return failure },
+			}},
+			{Name: 1},
+		},
+		Transitions: []statechart.Transition[int, int, struct{}]{
+			{From: 0, Event: 1, To: 1},
+		},
+	})
+	i, err := chart.New(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = i.Fire(context.Background(), 1, struct{}{})
+	var actionError *statechart.ActionError
+	if !errors.As(err, &actionError) || actionError.Completed != 1 || actionError.ActionIndex != 1 {
+		t.Fatalf("expected nil-action counting defect: %+v", err)
+	}
+	t.Log("Completed=1 although no nonnil lifecycle action returned successfully")
+}

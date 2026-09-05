@@ -1060,10 +1060,17 @@ func BenchmarkStatechartFire(b *testing.B) {
 	chart := benchmarkChart()
 	instance, _ := chart.New(a1)
 	data := &testData{}
+	event := goB
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _ = instance.Fire(context.Background(), goB, data)
-		_, _ = instance.Fire(context.Background(), reset, data)
+		if _, err := instance.Fire(context.Background(), event, data); err != nil {
+			b.Fatal(err)
+		}
+		if event == goB {
+			event = reset
+		} else {
+			event = goB
+		}
 	}
 }
 
@@ -1074,10 +1081,17 @@ func BenchmarkStatechartFireObserved(b *testing.B) {
 		func(context.Context, statechart.Observation[testState, testEvent], *testData) {},
 	)
 	data := &testData{}
+	event := goB
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _ = instance.Fire(context.Background(), goB, data)
-		_, _ = instance.Fire(context.Background(), reset, data)
+		if _, err := instance.Fire(context.Background(), event, data); err != nil {
+			b.Fatal(err)
+		}
+		if event == goB {
+			event = reset
+		} else {
+			event = goB
+		}
 	}
 }
 

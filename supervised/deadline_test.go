@@ -175,22 +175,35 @@ func TestOperationTimeoutUsesInjectedClock(t *testing.T) {
 
 type expiringContext struct {
 	context.Context
-	done chan struct{}
-	err  error
+	done       chan struct{}
+	err        error
+	beforeDone func()
 }
 
-func (c *expiringContext) Done() <-chan struct{} { return c.done }
-func (c *expiringContext) Err() error            { return c.err }
+func (c *expiringContext) Done() <-chan struct{} {
+	if c.beforeDone != nil {
+		c.beforeDone()
+	}
+	return c.done
+}
+func (c *expiringContext) Err() error { return c.err }
 
 func TestInvokePreservesCompletedCallbackErrorAtDeadline(t *testing.T) {
 	supervisor, _ := newUnjournaled(MustCompile(validDefinition()), limits())
 	supervisor.mu.Lock()
 	change := supervisor.currentChangeLocked()
 	ctx := &expiringContext{Context: context.Background(), done: make(chan struct{})}
-	op, _ := supervisor.beginOperationLocked(ctx, change, PhaseInvariant)
+	op, _ := supervisor.beginOperationLocked(context.Background(), change, PhaseInvariant)
 	supervisor.mu.Unlock()
 	defer supervisor.operationReturned(op)
 
+	// Expose the deadline only after the callback outcome is published. Closing
+	// Done inside a callback before it returns does not establish this ordering:
+	// the deadline is allowed to win before any callback outcome exists.
+	ctx.beforeDone = func() {
+		<-ctx.done
+		eventually(t, time.Second, func() bool { return !supervisor.Status().CallbackRunning })
+	}
 	sentinel := errors.New("mandatory check failed")
 	outcome := supervisor.invoke(op, ctx, change, PhaseInvariant, func(context.Context) error {
 		ctx.err = context.DeadlineExceeded

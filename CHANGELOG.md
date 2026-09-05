@@ -1,6 +1,65 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 — first stable release
+
+This version establishes the stable interface. Every earlier tag is a development
+prerelease, including the ordinary numeric tags through 1.3.2. The module and
+import path remain `github.com/open-ships/statemachine`; no compatibility shims
+are provided for prerelease interfaces or snapshots.
+
+- Give every Supervisor construction and restoration a fresh `IncarnationID`.
+  Attempt and lifecycle Record identities include it, preventing identity reuse
+  when a clean restart or guard refusal was not followed by a durable write.
+  Snapshot schema 2 carries the new identity evidence and rejects old schemas.
+- Keep each public Supervisor Operation live through its Recorder/Journal
+  finalization and every detached callback. Recovery refuses overlap until
+  that complete lifetime ends.
+- Retain Journal ownership until a timed-out callback actually finishes, and
+  refuse overlapping adapter delivery promptly with `ErrDeliveryBusy`. Stale
+  writes cannot overtake newer snapshots, and Trip does not queue behind an
+  unbounded backlog of Recorder deliveries. Adapter failures remain visible.
+- Retain bounded lifecycle history in causal sequence order, preserve original
+  Attempt timing and revision in `Record.Change`, and refuse exhausted Record
+  counters before sequence wraparound. Adopting an external self-transition
+  now commits and advances Revision just like successful Verification.
+- Bound diagnostic text rendering so a custom Trip cause's `Error` method
+  cannot block or panic during fault publication. Unknown error types use a
+  type description while the original error identity remains available.
+- Expand public-protocol regression coverage for late Journal writes, Recorder
+  finalization, repeated restoration, recovery, record identity, and diagnostics.
+- Reject unhashable dynamic keys and non-reflexive comparable keys such as NaN
+  consistently across Machine, Statechart, and MemoryStore. A zero Statechart
+  Instance safely refuses dynamic events that cannot be used as map keys.
+- Reuse compiled hierarchy relationships for Statechart transition paths and
+  Position inspection. Partial lifecycle diagnostics count only completed
+  non-nil actions.
+- Add typed Statechart `TimeoutObserver` and `ContainedObserver` helpers and
+  share copying, ordered delivery, composition, and failure containment across
+  execution models. Timeout callbacks receive a derived deadline context that
+  is canceled after delivery. Document overlapping abandoned callbacks and
+  unbounded report callbacks, and retain original nested panic/Goexit stacks.
+- Add queued `Options`/`NewWithOptions` to combine custom limits and observers.
+  Preserve original queued callback panic values while exposing bounded origin
+  stack evidence through `Runtime.LastPanic`. Reuse the eager `Permitted`
+  snapshot without a second copy.
+- Add reusable `persist/persisttest` Store contract checks and a separate real
+  SQLite integration module covering transactions, state/outbox atomicity,
+  rollback, conflict handling, and an injected post-commit response failure.
+  Strengthen Store ownership and callback validation without adding root-module
+  dependencies. Applications still own production-database validation.
+- Centralize local and CI assurance in scripts with pinned analysis tools, a
+  90% race-tested coverage floor, dependency-graph verification, and SQLite
+  integration. Use Go 1.26.8 for routine checks and releases, test Go 1.27.1
+  compatibility, and keep Go 1.26.0 as the separately tested language minimum.
+- Retain per-change and campaign fuzz failures, pass manual fuzz inputs through
+  environment variables, and retain three 100 ms benchmark samples with
+  allocation data instead of ten-iteration smoke timings.
+- Pin the reviewed shared release workflow by commit and align provenance
+  documentation with annotated tags, checksums, and artifact attestations.
+  `VERSION` selects 1.4.0 as the next release baseline; later stable releases
+  follow the compatibility policy in `CONTRIBUTING.md`.
+
+## 1.3.2 — prerelease
 
 - Replace the caller-owned, effectful `Machine.Fire` interface with pure
   `Machine.Next`. `Next` runs Guards and selects a destination but cannot run
@@ -9,11 +68,12 @@
   the lost-transition hazard where an effect ran but its returned state was
   discarded.
 
-## 1.3.0
+## 1.3.0 — prerelease
 
-This release is the API. The project is pre-adoption, so it stays in v1
-versioning space and contains breaking changes relative to v1.2.1; the
-previously drafted 2.0.0 was never tagged and its changes land here.
+This development release contained breaking changes relative to 1.2.1. Its
+historical notes describe the intended behavior at the time; the Supervisor
+identity, ordering, and finalization defects in that implementation are corrected
+in 1.4.0. The previously drafted 2.0.0 was never tagged.
 
 - Assign Supervisor lifecycle Record identity (ExecutionID, Restarts, Seq) atomically with the state decision it describes, so Seq order is causal order; bound the in-process Records history with `Limits.MaxRecords` and count evictions and Recorder failures in Status.
 - Persist the Record high-water mark and a Restarts incarnation counter in Snapshots so a restored execution never reuses durable Record identity, and stamp Snapshots with a schema Version that Restore validates.

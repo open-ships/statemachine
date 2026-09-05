@@ -1,0 +1,431 @@
+package supervised
+
+import (
+	"context"
+	"errors"
+	"math"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestReviewLateClosureOverwritesNewPreparation(t *testing.T) {
+	definition := validDefinition()
+	definition.States[1].Terminal = false
+	definition.Transitions = append(definition.Transitions, Transition[testState, testEvent, *testData]{ID: "again", From: testRunning, Event: testStart, To: testRunning, Issue: passAction, Verify: passCheck})
+	machine := MustCompile(definition)
+	var mu sync.Mutex
+	var durable Snapshot[testState, testEvent]
+	release := make(chan struct{})
+	oldDone := make(chan struct{})
+	blocked := false
+	journal := func(_ context.Context, snapshot Snapshot[testState, testEvent]) error {
+		mu.Lock()
+		delay := !snapshot.InDoubt && !snapshot.Faulted && snapshot.Revision == 1 && !blocked
+		if delay {
+			blocked = true
+		}
+		mu.Unlock()
+		if delay {
+			<-release
+		}
+		mu.Lock()
+		durable = snapshot
+		mu.Unlock()
+		if delay {
+			close(oldDone)
+		}
+		return nil
+	}
+	supervisor, err := NewWithOptions(machine, Options[testState, testEvent]{Limits: limits(), RecorderTimeout: 5 * time.Millisecond, Journal: journal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err = supervisor.Start(ctx, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := supervisor.Issue(ctx, testStart, &testData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = supervisor.Verify(ctx, first.AttemptKey, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	if supervisor.Status().JournalError == "" {
+		t.Fatal("closure did not time out")
+	}
+	second, err := supervisor.Issue(ctx, testStart, &testData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	prepared := durable
+	mu.Unlock()
+	if !prepared.InDoubt || prepared.Pending.Attempt != second.AttemptKey {
+		t.Fatalf("not prepared: %+v", prepared)
+	}
+	close(release)
+	<-oldDone
+	mu.Lock()
+	lost := durable
+	mu.Unlock()
+	if lost.InDoubt || lost.Attempt != first.Attempt {
+		t.Fatalf("failed to reproduce: %+v", lost)
+	}
+	restored, err := RestoreWithOptions(machine, lost, Options[testState, testEvent]{Limits: limits(), Journal: journal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = restored.Start(ctx, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := restored.Issue(ctx, testStart, &testData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.AttemptKey != second.AttemptKey {
+		t.Fatalf("expected duplicate durable attempt, got %+v and %+v", repeated.AttemptKey, second.AttemptKey)
+	}
+	t.Logf("older clean closure erased in-doubt second attempt; restore accepted clean snapshot and reused attempt %+v", repeated.AttemptKey)
+}
+
+func TestReviewRecordCounterWrapsOnValidRestore(t *testing.T) {
+	machine := MustCompile(validDefinition())
+	s, err := restoreUnjournaled(machine, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: machine.ID(), ExecutionID: "id", State: testIdle, Records: math.MaxUint64}, limits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Start(context.Background(), &testData{}); !errors.Is(err, ErrCounterExhausted) {
+		t.Fatalf("start: %v", err)
+	}
+	if got := s.Records()[0].Seq; got != 0 {
+		t.Fatalf("wanted observed wraparound, got %d", got)
+	}
+	t.Log("valid restored record high-water MaxUint64 wraps to zero")
+}
+
+func TestReviewCleanRestartsReuseDurableRecordIdentity(t *testing.T) {
+	machine := MustCompile(validDefinition())
+	store := &lastSnapshotJournal{}
+	var delivered []Record[testState, testEvent]
+	options := Options[testState, testEvent]{Limits: limits(), Journal: store.journal(), Recorder: func(_ context.Context, r Record[testState, testEvent]) error {
+		delivered = append(delivered, r)
+		return nil
+	}}
+	s, err := NewWithOptions(machine, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err = s.Start(ctx, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := s.Issue(ctx, testStart, &testData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Verify(ctx, issued.AttemptKey, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	var records []Record[testState, testEvent]
+	for range 2 {
+		durable, ok := store.snapshot()
+		if !ok {
+			t.Fatal("no durable snapshot")
+		}
+		restored, err := RestoreWithOptions(machine, durable, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = restored.Start(ctx, &testData{}); err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, restored.Records()[0])
+		// Crash: leave only the latest saved Journal snapshot and durable Recorder delivery.
+	}
+	a, b := records[0], records[1]
+	if a.ExecutionID != b.ExecutionID || a.Restarts != b.Restarts || a.Seq != b.Seq {
+		t.Fatalf("expected duplicate, got %+v %+v", a, b)
+	}
+	t.Logf("repeated clean restarts durably deliver identical identity (%s,%d,%d)", a.ExecutionID, a.Restarts, a.Seq)
+}
+
+func TestReviewAdoptSelfTransitionSkipsRevision(t *testing.T) {
+	definition := validDefinition()
+	definition.States = definition.States[:1]
+	definition.Transitions[0].To = testIdle
+	s, err := newUnjournaled(MustCompile(definition), limits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err = s.Start(ctx, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Issue(ctx, testStart, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	s.Trip(errors.New("physical command outcome unknown"))
+	adopted, err := s.Adjudicate(ctx, Decision[testState]{Outcome: AdjudicateAdopt, Evidence: "controller completed"}, &testData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted.Committed || adopted.Revision != 0 {
+		t.Fatalf("expected observed skipped commit: %+v", adopted)
+	}
+	t.Logf("adoption returns Committed=%v Revision=%d; normal Verify of this row increments Revision", adopted.Committed, adopted.Revision)
+}
+
+func TestReviewRecordChangesLoseOriginalAttemptMetadata(t *testing.T) {
+	definition := validDefinition()
+	var seen Change[testState, testEvent]
+	definition.Transitions[0].Verify = func(_ context.Context, c Change[testState, testEvent], _ *testData) error { seen = c; return nil }
+	s, err := newUnjournaled(MustCompile(definition), limits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err = s.Start(ctx, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := s.Issue(ctx, testStart, &testData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Verify(ctx, issued.AttemptKey, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	last := s.Records()[2]
+	if last.Change.Revision == seen.Revision || last.Change.StartedAt == seen.StartedAt {
+		t.Fatalf("failed to reproduce metadata rewrite: %+v %+v", last.Change, seen)
+	}
+	t.Logf("Verify receives attempt revision %d started %v; Record.Change carries revision %d started %v", seen.Revision, seen.StartedAt, last.Change.Revision, last.Change.StartedAt)
+}
+
+func TestReviewRecoverRunsWhilePriorPublicIssueAndRecorderAreLive(t *testing.T) {
+	definition := validDefinition()
+	definition.Preconditions = []Precondition[testState, testEvent, *testData]{func(context.Context, Attempt[testState, testEvent], *testData) error {
+		return errors.New("precondition failed")
+	}}
+	recording := make(chan struct{})
+	release := make(chan struct{})
+	recovered := make(chan struct{})
+	var reconciles atomic.Int32
+	definition.Reconcile = []Reconciler[testState, testEvent, *testData]{func(context.Context, Snapshot[testState, testEvent], *testData) error {
+		if reconciles.Add(1) == 2 {
+			close(recovered)
+		}
+		return nil
+	}}
+	recorder := func(ctx context.Context, r Record[testState, testEvent]) error {
+		if r.Kind == RecordIssue {
+			close(recording)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+	s, err := NewWithOptions(MustCompile(definition), Options[testState, testEvent]{Limits: limits(), Unjournaled: true, Recorder: recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err = s.Start(ctx, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	issueDone := make(chan error, 1)
+	go func() { _, err := s.Issue(ctx, testStart, &testData{}); issueDone <- err }()
+	<-recording
+	status := s.Status()
+	if status.OperationRunning || status.CallbackRunning {
+		t.Fatalf("failed to reproduce premature ownership release: %+v", status)
+	}
+	recoverDone := make(chan error, 1)
+	go func() { _, err := s.Recover(ctx, &testData{}); recoverDone <- err }()
+	select {
+	case <-recovered:
+	case err := <-recoverDone:
+		close(release)
+		t.Fatalf("Recover rejected as expected; wanted observed defect: %v", err)
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("Recover did not reach reconcile")
+	}
+	select {
+	case <-issueDone:
+		close(release)
+		t.Fatal("prior public Issue already returned")
+	default:
+	}
+	close(release)
+	if err := <-recoverDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-issueDone; !errors.Is(err, ErrViolation) {
+		t.Fatalf("Issue: %v", err)
+	}
+	t.Log("Recover reconciler ran while prior public Issue and its cooperative Recorder callback were still live; Status claimed no operation/callback")
+}
+
+func TestReviewRecorderReentryNecessarilyTimesOut(t *testing.T) {
+	var s *Supervisor[testState, testEvent, *testData]
+	tripped := make(chan struct{})
+	recorder := func(_ context.Context, r Record[testState, testEvent]) error {
+		if r.Kind == RecordIssue {
+			s.Trip(errors.New("recorder raises fault"))
+			close(tripped)
+		}
+		return nil
+	}
+	var err error
+	s, err = NewWithOptions(MustCompile(validDefinition()), Options[testState, testEvent]{Limits: limits(), RecorderTimeout: 5 * time.Millisecond, Unjournaled: true, Recorder: recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Start(context.Background(), &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.Issue(context.Background(), testStop, &testData{})
+	<-tripped
+	status := s.Status()
+	if status.RecorderFailures != 1 {
+		t.Fatalf("expected caused timeout, got %+v", status)
+	}
+	t.Logf("otherwise immediately returning Recorder calls public Trip, causing guaranteed self-wait and RecorderFailures=%d (%s)", status.RecorderFailures, status.RecorderError)
+}
+
+func TestReviewTripWaitIsProportionalToConcurrentRecordBacklog(t *testing.T) {
+	timeout := 20 * time.Millisecond
+	recording := make(chan struct{}, 8)
+	recorder := func(ctx context.Context, _ Record[testState, testEvent]) error {
+		recording <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	s, err := NewWithOptions(MustCompile(validDefinition()), Options[testState, testEvent]{Limits: Limits{OperationTimeout: time.Millisecond, VerificationTimeout: time.Second}, RecorderTimeout: timeout, Unjournaled: true, Recorder: recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var done sync.WaitGroup
+	for i := uint64(1); i <= 6; i++ {
+		done.Go(func() { _, _ = s.Issue(context.Background(), testStart, &testData{}) })
+		deadline := time.Now().Add(time.Second)
+		for s.Snapshot().Records < i {
+			if time.Now().After(deadline) {
+				t.Fatal("admission did not stamp")
+			}
+			runtime.Gosched()
+		}
+	}
+	<-recording
+	before := time.Now()
+	s.Trip(errors.New("trip after six refused calls"))
+	elapsed := time.Since(before)
+	done.Wait()
+	if elapsed < 4*timeout {
+		t.Fatalf("backlog wait shorter than expected: %v", elapsed)
+	}
+	t.Logf("Trip took %s with RecorderTimeout=%s and six concurrent refused calls; documented approximate two-interval bound=%s", elapsed, timeout, 2*timeout)
+}
+
+type reviewYieldClock struct {
+	count   atomic.Uint64
+	yieldAt atomic.Uint64
+	yielded chan struct{}
+}
+
+func (c *reviewYieldClock) Now() time.Time {
+	n := c.count.Add(1)
+	if c.yieldAt.CompareAndSwap(n, 0) {
+		close(c.yielded)
+		runtime.Gosched()
+	}
+	return time.Now()
+}
+func (c *reviewYieldClock) AfterFunc(d time.Duration, f func()) Timer { return time.AfterFunc(d, f) }
+
+func TestReviewCausalRingEvictsNewTripForOlderResult(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	clock := &reviewYieldClock{yielded: make(chan struct{})}
+	s, err := NewWithOptions(MustCompile(validDefinition()), Options[testState, testEvent]{Limits: Limits{OperationTimeout: time.Second, VerificationTimeout: time.Second, MaxRecords: 1}, Clock: clock, Unjournaled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Nil-context Issue has exactly two Now calls: stamp under mu, completeResult outside mu.
+	// Yield at the latter: Now stays non-blocking and the test can exercise a valid scheduler order.
+	clock.yieldAt.Store(clock.count.Load() + 2)
+	done := make(chan struct{})
+	go func() { _, _ = s.Issue(nil, testStart, &testData{}); close(done) }()
+	<-clock.yielded
+	s.Trip(errors.New("newer critical trip"))
+	before := s.Records()[0]
+	if before.Seq != 2 || before.Kind != RecordTrip {
+		t.Fatalf("schedule did not produce newer first: %+v", before)
+	}
+	<-done
+	records := s.Records()
+	if len(records) != 1 || records[0].Seq != 1 || records[0].Kind != RecordIssue {
+		t.Fatalf("failed to reproduce older eviction: %+v", records)
+	}
+	t.Logf("ring retained older Seq=%d Kind=%s, evicting newer Trip Seq=2; high-water=%d", records[0].Seq, records[0].Kind, s.Snapshot().Records)
+}
+
+func TestReviewRefusedAcceptedAttemptIsReusedAfterRestore(t *testing.T) {
+	definition := validDefinition()
+	definition.States[1].Terminal = false
+	definition.Transitions = append(definition.Transitions, Transition[testState, testEvent, *testData]{ID: "again", From: testRunning, Event: testStart, To: testRunning, Issue: passAction, Verify: passCheck, Guard: func(_ context.Context, _ Change[testState, testEvent], d *testData) error {
+		if !d.allow {
+			return errors.New("declined")
+		}
+		return nil
+	}})
+	machine := MustCompile(definition)
+	store := &lastSnapshotJournal{}
+	options := Options[testState, testEvent]{Limits: limits(), Journal: store.journal()}
+	s, err := NewWithOptions(machine, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err = s.Start(ctx, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.Issue(ctx, testStart, &testData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Verify(ctx, first.AttemptKey, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	refused, err := s.Issue(ctx, testStart, &testData{})
+	if !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("refused: %v", err)
+	}
+	durable, ok := store.snapshot()
+	if !ok {
+		t.Fatal("no snapshot")
+	}
+	restored, err := RestoreWithOptions(machine, durable, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = restored.Start(ctx, &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := restored.Issue(ctx, testStart, &testData{allow: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issued.AttemptKey != refused.AttemptKey {
+		t.Fatalf("expected reused accepted attempt: %+v %+v", issued.AttemptKey, refused.AttemptKey)
+	}
+	t.Logf("new issued AttemptKey %+v equals accepted-but-refused pre-crash AttemptKey; latest durable Attempt=%d", issued.AttemptKey, durable.Attempt)
+}

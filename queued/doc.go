@@ -28,8 +28,10 @@
 // to Fire can disagree with it, especially on errors and panics.
 //
 // Runtime has finite outstanding-root and cumulative Run-event limits; use
-// [NewWithLimits] to configure them. A canceled root that has not started is
-// removed and returns promptly.
+// [NewWithLimits] to configure them, or [NewWithOptions] to combine custom
+// limits with observers. A canceled root that has not started is removed and
+// returns promptly. LastPanic preserves one bounded originating stack while
+// Fire continues to re-panic the original value in its caller's goroutine.
 //
 // [NewWithObservers] attaches immutable observers to the Runtime. Every
 // non-self committed item emits an exit and entry before the next follow-up

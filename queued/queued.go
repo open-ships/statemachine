@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"iter"
+	goruntime "runtime"
 	"sync"
+	"time"
 
 	"github.com/open-ships/statemachine"
 )
@@ -49,6 +51,22 @@ type Limits struct {
 	MaxRunEvents int
 }
 
+// Options configures a Runtime. Zero Limits selects the default bounds;
+// otherwise both limits must be positive. Observers are copied at construction.
+type Options[S, E comparable, T any] struct {
+	Limits    Limits
+	Observers []statemachine.Observer[S, E, T]
+}
+
+// PanicInfo preserves the most recent Guard or Do panic's originating stack.
+// Stack is limited to 64 KiB and may be truncated. The original panic value is
+// re-panicked by Fire rather than retained by the Runtime.
+type PanicInfo[E comparable] struct {
+	Event E
+	At    time.Time
+	Stack string
+}
+
 var defaultLimits = Limits{MaxRoots: DefaultMaxRoots, MaxRunEvents: DefaultMaxRunEvents}
 
 // A Runtime owns the current state of one aggregate and serializes events for
@@ -71,6 +89,7 @@ type Runtime[S, E comparable, T any] struct {
 	rootCount int
 	observers []statemachine.Observer[S, E, T]
 	seq       uint64
+	lastPanic *PanicInfo[E]
 }
 
 // Status is one atomic Runtime scheduling snapshot.
@@ -85,6 +104,21 @@ type Status[S comparable] struct {
 // Machine, which refuses every event.
 func New[S, E comparable, T any](machine *statemachine.Machine[S, E, T], initial S) *Runtime[S, E, T] {
 	return newRuntime(machine, initial, defaultLimits, nil)
+}
+
+// NewWithOptions constructs a Runtime with independently configurable bounds
+// and observers. Construction emits no observations. Nil observers are ignored.
+func NewWithOptions[S, E comparable, T any](
+	machine *statemachine.Machine[S, E, T], initial S, options Options[S, E, T],
+) (*Runtime[S, E, T], error) {
+	limits := options.Limits
+	if limits == (Limits{}) {
+		limits = defaultLimits
+	}
+	if limits.MaxRoots <= 0 || limits.MaxRunEvents <= 0 {
+		return nil, ErrInvalidLimits
+	}
+	return newRuntime(machine, initial, limits, options.Observers), nil
 }
 
 // NewWithLimits constructs a Runtime with explicit finite resource limits.
@@ -130,6 +164,18 @@ func (r *Runtime[S, E, T]) State() S {
 	return r.instance.State()
 }
 
+// LastPanic returns a snapshot of the most recent Guard or Do panic, if any.
+// Only one record is retained; a later root's panic replaces it. Successful
+// roots do not erase it. This diagnostic does not change panic propagation.
+func (r *Runtime[S, E, T]) LastPanic() (PanicInfo[E], bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lastPanic == nil {
+		return PanicInfo[E]{}, false
+	}
+	return *r.lastPanic, true
+}
+
 // Status reports committed state, scheduler activity, admitted roots, and
 // configured resource bounds atomically.
 func (r *Runtime[S, E, T]) Status() Status[S] {
@@ -158,7 +204,7 @@ func (r *Runtime[S, E, T]) Status() Status[S] {
 // events in this root and discards its remaining follow-ups without affecting
 // later roots. A panic does the same cleanup and is re-panicked with its
 // original value in the goroutine that called Fire; later queued roots remain
-// runnable. A callback that calls runtime.Goexit instead returns
+// runnable. LastPanic preserves its originating stack. A callback that calls runtime.Goexit instead returns
 // [ErrExecutionStopped]; see that error for the legacy nil-panic exception.
 //
 // Fire passes an execution context to Guards and effects. Calling Fire on any
@@ -243,22 +289,7 @@ func (r *Runtime[S, E, T]) removeRootLocked(target *root[E, T, S]) bool {
 // can overlap an executing callback; callers must synchronize mutable data in
 // T and keep Guards pure.
 func (r *Runtime[S, E, T]) Permitted(ctx context.Context, data T) iter.Seq2[E, S] {
-	type pair struct {
-		event E
-		to    S
-	}
-	var snapshot []pair
-	for event, to := range r.instance.Permitted(ctx, data) {
-		snapshot = append(snapshot, pair{event, to})
-	}
-
-	return func(yield func(E, S) bool) {
-		for _, p := range snapshot {
-			if !yield(p.event, p.to) {
-				return
-			}
-		}
-	}
+	return r.instance.Permitted(ctx, data)
 }
 
 // Enqueue appends event to this Runtime's cascade identified by ctx. It does not wait for
@@ -446,6 +477,7 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 	}
 
 	completed := false
+	var current item[E, T]
 	defer func() {
 		recovered := recover()
 		if completed {
@@ -454,6 +486,11 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 		c.abort()
 		result = outcome[S]{state: r.State(), err: ErrExecutionStopped}
 		if recovered != nil {
+			stack := make([]byte, 64<<10)
+			stack = stack[:goruntime.Stack(stack, false)]
+			r.mu.Lock()
+			r.lastPanic = &PanicInfo[E]{Event: current.event, At: time.Now(), Stack: string(stack)}
+			r.mu.Unlock()
 			result = outcome[S]{
 				state:      r.State(),
 				panicked:   true,
@@ -463,7 +500,7 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 	}()
 
 	execCtx := context.WithValue(req.ctx, executionKey{}, x)
-	current := item[E, T]{ctx: execCtx, event: req.event, data: req.data}
+	current = item[E, T]{ctx: execCtx, event: req.event, data: req.data}
 	var observerFailures []error
 
 	for {

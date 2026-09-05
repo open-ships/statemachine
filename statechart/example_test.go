@@ -53,19 +53,28 @@ func Example() {
 		},
 	})
 
-	run, _ := chart.New(Call) // restoration follows initials but runs no entry action
+	run, err := chart.New(Call) // restoration follows initials but runs no entry action
+	if err != nil {
+		panic(err)
+	}
 	fmt.Println("initial:", run.State())
 
 	command := &Command{}
-	_, _ = run.Fire(context.Background(), Answer, command)
+	if _, err := run.Fire(context.Background(), Answer, command); err != nil {
+		panic(err)
+	}
 	fmt.Println("answer:", run.State(), command.Trace)
 
 	command.Trace = nil
-	_, _ = run.Fire(context.Background(), Restart, command) // inherited from Call
+	if _, err := run.Fire(context.Background(), Restart, command); err != nil {
+		panic(err)
+	} // inherited from Call
 	fmt.Println("restart:", run.State(), command.Trace)
 
 	command.Trace = nil
-	_, _ = run.Fire(context.Background(), Hangup, command) // inherited from Call
+	if _, err := run.Fire(context.Background(), Hangup, command); err != nil {
+		panic(err)
+	} // inherited from Call
 	fmt.Println("hangup:", run.State(), command.Trace)
 
 	// Output:
@@ -145,8 +154,13 @@ func ExampleObserver_census() {
 		fmt.Println(command.ID, observation.Seq, observation.Move, observation.State)
 	}
 
-	run, _ := chart.NewWithObservers(Ringing, observer)
-	_, _ = run.Fire(context.Background(), Hangup, &Command{ID: "A1"})
+	run, err := chart.NewWithObservers(Ringing, observer)
+	if err != nil {
+		panic(err)
+	}
+	if _, err := run.Fire(context.Background(), Hangup, &Command{ID: "A1"}); err != nil {
+		panic(err)
+	}
 	fmt.Println("census:", counts[Call], counts[Ringing], counts[Idle])
 
 	// Output:
@@ -154,4 +168,44 @@ func ExampleObserver_census() {
 	// A1 2 exited call
 	// A1 3 entered idle
 	// census: 0 0 1
+}
+
+// External computes lifecycle paths from the active Source to Target. An
+// inherited handler does not imply that its own lifecycle runs again.
+func ExampleKind_inheritedHandler() {
+	var trace []string
+	record := func(label string) statechart.Action[string, string, struct{}] {
+		return func(context.Context, statechart.Info[string, string], struct{}) error {
+			trace = append(trace, label)
+			return nil
+		}
+	}
+	chart := statechart.MustCompile(statechart.Definition[string, string, struct{}]{
+		States: []statechart.State[string, string, struct{}]{
+			{Name: "parent", Entry: []statechart.Action[string, string, struct{}]{record("enter parent")}, Exit: []statechart.Action[string, string, struct{}]{record("exit parent")}},
+			{Name: "leaf", Entry: []statechart.Action[string, string, struct{}]{record("enter leaf")}, Exit: []statechart.Action[string, string, struct{}]{record("exit leaf")}},
+		},
+		Substates: []statechart.Substate[string]{{Child: "leaf", Parent: "parent"}},
+		Initials:  []statechart.Initial[string]{{Parent: "parent", Child: "leaf"}},
+		Transitions: []statechart.Transition[string, string, struct{}]{
+			{From: "parent", Event: "external", To: "leaf", Do: record("effect")},
+			{From: "parent", Event: "reentry", To: "parent", Kind: statechart.Reentry, Do: record("effect")},
+		},
+	})
+	instance, err := chart.New("leaf")
+	if err != nil {
+		panic(err)
+	}
+	if _, err := instance.Fire(context.Background(), "external", struct{}{}); err != nil {
+		panic(err)
+	}
+	fmt.Println("external:", trace)
+	trace = nil
+	if _, err := instance.Fire(context.Background(), "reentry", struct{}{}); err != nil {
+		panic(err)
+	}
+	fmt.Println("reentry:", trace)
+	// Output:
+	// external: [effect]
+	// reentry: [exit leaf exit parent effect enter parent enter leaf]
 }

@@ -10,6 +10,8 @@ import (
 	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/open-ships/statemachine/internal/keycheck"
 )
 
 // recordSeqMargin is the headroom kept below the Record sequence ceiling.
@@ -49,8 +51,10 @@ type activeOperation[S, E comparable] struct {
 }
 
 type faultRecord[S, E comparable] struct {
+	Change               Change[S, E]
 	DefinitionID         string
 	ExecutionID          string
+	IncarnationID        string
 	Attempt              uint64
 	Revision             uint64
 	State                S
@@ -71,7 +75,8 @@ func (f *faultRecord[S, E]) snapshot() *Fault[S, E] {
 		return nil
 	}
 	return &Fault[S, E]{
-		DefinitionID: f.DefinitionID, ExecutionID: f.ExecutionID,
+		Change:       f.Change,
+		DefinitionID: f.DefinitionID, ExecutionID: f.ExecutionID, IncarnationID: f.IncarnationID,
 		Attempt: f.Attempt, Revision: f.Revision,
 		State: f.State, Event: f.Event, TransitionID: f.TransitionID,
 		To: f.To, Phase: f.Phase, Uncertain: f.Uncertain,
@@ -82,7 +87,7 @@ func (f *faultRecord[S, E]) snapshot() *Fault[S, E] {
 }
 
 // Supervisor owns one committed state under a strict Machine. It executes at
-// most one callback at a time, holds at most one Change awaiting verification,
+// most one admitted Operation at a time, holds at most one Change awaiting verification,
 // and latches the first Fault until Recover or Adjudicate reconciles
 // application state.
 //
@@ -90,23 +95,22 @@ func (f *faultRecord[S, E]) snapshot() *Fault[S, E] {
 // use. It is not a safety controller: timing out or cancelling a callback does
 // not terminate arbitrary Go code or prove that external effects stopped.
 type Supervisor[S, E comparable, T any] struct {
-	mu sync.Mutex
-	// recordMu serializes Recorder delivery. It is never held while mu-only
-	// work runs, and mu is acquired inside it, never the reverse.
-	recordMu sync.Mutex
-	// journalMu serializes Journal writes — preparation and closure — so the
-	// journal converges in decision order. Snapshots are captured under mu
-	// inside journalMu; the lock order is always journalMu, then mu.
-	journalMu   sync.Mutex
-	machine     Machine[S, E, T]
-	limits      Limits
-	clock       Clock
-	mode        Mode
-	state       S
-	executionID string
-	restarts    uint64
-	revision    uint64
-	attempt     uint64
+	mu              sync.Mutex
+	recorderGate    deliveryGate
+	journalGate     deliveryGate
+	recorderRunning bool
+	journalRunning  bool
+	reporting       int
+	machine         Machine[S, E, T]
+	limits          Limits
+	clock           Clock
+	mode            Mode
+	state           S
+	executionID     string
+	incarnationID   string
+	restarts        uint64
+	revision        uint64
+	attempt         uint64
 
 	pending          *pendingChange[S, E, T]
 	fault            *faultRecord[S, E]
@@ -117,7 +121,6 @@ type Supervisor[S, E comparable, T any] struct {
 	recorderTimeout  time.Duration
 	journal          Journal[S, E]
 	records          []Record[S, E]
-	recordHead       int
 	maxRecords       int
 	nextRecord       uint64
 	droppedRecords   uint64
@@ -134,14 +137,21 @@ type Supervisor[S, E comparable, T any] struct {
 // RecorderFailures and RecordsDropped count every Recorder failure and every
 // Record evicted from the bounded in-process history since construction.
 type Status[S, E comparable] struct {
-	Mode                 Mode
-	Snapshot             Snapshot[S, E]
-	Attempt              uint64
-	Restarts             uint64
-	Pending              *Change[S, E]
-	Fault                *Fault[S, E]
-	CallbackRunning      bool
-	OperationRunning     bool
+	Mode             Mode
+	Snapshot         Snapshot[S, E]
+	Attempt          uint64
+	Restarts         uint64
+	Pending          *Change[S, E]
+	Fault            *Fault[S, E]
+	CallbackRunning  bool
+	OperationRunning bool
+	RecorderRunning  bool
+	JournalRunning   bool
+	// ReportingRunning covers Trip and verification-expiry publication,
+	// including intervals before an adapter callback has started. New work
+	// remains blocked until this reporting completes.
+	ReportingRunning     bool
+	RecordsExhausted     bool
 	Operation            uint64
 	Active               Change[S, E]
 	Phase                Phase
@@ -192,6 +202,7 @@ func newSupervisor[S, E comparable, T any](
 		mode:            ModeStopped,
 		state:           machine.initial,
 		executionID:     executionID,
+		incarnationID:   executionID,
 		maxRecords:      resolvedMaxRecords(limits),
 		recorderTimeout: limits.OperationTimeout,
 	}, nil
@@ -238,6 +249,9 @@ func NewWithOptions[S, E comparable, T any](
 }
 
 func requireJournal[S, E comparable](external bool, options Options[S, E]) error {
+	if options.RecorderTimeout < 0 {
+		return ErrInvalidLimits
+	}
 	if options.RequireJournal && options.Journal == nil {
 		return ErrJournalRequired
 	}
@@ -294,20 +308,26 @@ func restoreSupervisor[S, E comparable, T any](
 	if snapshot.DefinitionID != machine.id {
 		return nil, ErrDefinitionMismatch
 	}
-	if snapshot.ExecutionID == "" {
+	if snapshot.ExecutionID == "" || snapshot.IncarnationID == "" {
 		return nil, ErrInvalidSnapshot
+	}
+	if !keycheck.Value(snapshot.State) {
+		return nil, ErrInvalidKey
 	}
 	if _, known := machine.stateIndex[snapshot.State]; !known {
 		return nil, ErrUnknownState
 	}
-	if snapshot.Revision == math.MaxUint64 || snapshot.Restarts == math.MaxUint64 {
+	if snapshot.Revision == math.MaxUint64 || snapshot.Restarts == math.MaxUint64 || snapshot.Records >= math.MaxUint64-recordSeqMargin {
 		return nil, ErrCounterExhausted
 	}
 	if snapshot.InDoubt != (snapshot.Pending != nil) {
 		return nil, ErrInvalidSnapshot
 	}
 	if pending := snapshot.Pending; pending != nil {
-		if pending.Attempt.ExecutionID != snapshot.ExecutionID || pending.Attempt.Sequence == 0 ||
+		if !keycheck.Value(pending.From) || !keycheck.Value(pending.Event) || !keycheck.Value(pending.To) {
+			return nil, ErrInvalidKey
+		}
+		if pending.Attempt.ExecutionID != snapshot.ExecutionID || pending.Attempt.IncarnationID == "" || pending.Attempt.Sequence == 0 ||
 			pending.Attempt.Sequence > snapshot.Attempt || pending.Revision != snapshot.Revision ||
 			pending.From != snapshot.State {
 			return nil, ErrInvalidSnapshot
@@ -323,6 +343,10 @@ func restoreSupervisor[S, E comparable, T any](
 			return nil, ErrInvalidSnapshot
 		}
 	}
+	incarnationID, err := newExecutionID()
+	if err != nil {
+		return nil, err
+	}
 	supervisor := &Supervisor[S, E, T]{
 		machine:         *machine,
 		limits:          limits,
@@ -333,6 +357,7 @@ func restoreSupervisor[S, E comparable, T any](
 		revision:        snapshot.Revision,
 		attempt:         snapshot.Attempt,
 		executionID:     snapshot.ExecutionID,
+		incarnationID:   incarnationID,
 		nextRecord:      snapshot.Records,
 		maxRecords:      resolvedMaxRecords(limits),
 		recorderTimeout: limits.OperationTimeout,
@@ -344,13 +369,20 @@ func restoreSupervisor[S, E comparable, T any](
 		}
 		supervisor.mode = ModeFaulted
 		supervisor.fault = &faultRecord[S, E]{
-			DefinitionID: machine.id, ExecutionID: snapshot.ExecutionID,
+			DefinitionID: machine.id, ExecutionID: snapshot.ExecutionID, IncarnationID: snapshot.IncarnationID,
 			Attempt: snapshot.Attempt, Revision: snapshot.Revision,
 			State: snapshot.State, Phase: snapshot.FaultPhase,
 			Uncertain:  snapshot.Uncertain || snapshot.InDoubt,
 			OccurredAt: snapshot.RecordedAt, CauseText: cause.Error(), Cause: cause,
 		}
 		if pending := snapshot.Pending; pending != nil {
+			supervisor.fault.Change = Change[S, E]{Attempt: Attempt[S, E]{
+				DefinitionID: machine.id, ExecutionID: pending.Attempt.ExecutionID,
+				IncarnationID: pending.Attempt.IncarnationID, ID: pending.Attempt.Sequence,
+				Revision: pending.Revision, StartedAt: pending.StartedAt,
+				From: pending.From, Event: pending.Event,
+			}, TransitionID: pending.TransitionID, To: pending.To}
+			supervisor.fault.IncarnationID = pending.Attempt.IncarnationID
 			supervisor.fault.Attempt = pending.Attempt.Sequence
 			supervisor.fault.Event = pending.Event
 			supervisor.fault.TransitionID = pending.TransitionID
@@ -425,13 +457,14 @@ func (s *Supervisor[S, E, T]) countersExhaustedLocked() bool {
 // failure latches a Fault; success moves the Supervisor to Ready.
 func (s *Supervisor[S, E, T]) Start(ctx context.Context, data T) (Result[S, E], error) {
 	result := s.start(ctx, data)
-	s.completeResult(&result)
-	s.recordResult(RecordStart, result)
-	s.closeJournalAfter(result)
 	return result, result.Err
 }
 
 func (s *Supervisor[S, E, T]) start(ctx context.Context, data T) Result[S, E] {
+	return s.finalize(RecordStart, s.startDecision(ctx, data))
+}
+
+func (s *Supervisor[S, E, T]) startDecision(ctx context.Context, data T) Result[S, E] {
 	if ctx == nil {
 		return s.statusResult(PhaseStart, ErrNilContext)
 	}
@@ -458,19 +491,25 @@ func (s *Supervisor[S, E, T]) start(ctx context.Context, data T) Result[S, E] {
 		s.mu.Unlock()
 		return base
 	}
+	if s.operation != nil || s.recorderRunning || s.journalRunning || s.reporting != 0 {
+		base.Err = ErrBusy
+		base.stamp = s.stampLocked()
+		s.mu.Unlock()
+		return base
+	}
 	change := s.currentChangeLocked()
 	if s.countersExhaustedLocked() {
 		op, _ := s.beginOperationLocked(ctx, change, PhaseStart)
+		base.Operation, base.owner = op.id, op
 		s.mu.Unlock()
-		defer s.operationReturned(op)
 		return s.latchResult(base, op, change, PhaseStart, ErrCounterExhausted, false)
 	}
 	op, opCtx := s.beginOperationLocked(ctx, change, PhaseStart)
 	base.StartedAt = op.startedAt
 	base.Operation = op.id
+	base.owner = op
 	snapshot := s.snapshotLocked()
 	s.mu.Unlock()
-	defer s.operationReturned(op)
 
 	for _, reconcile := range s.machine.reconcile {
 		outcome := s.invoke(op, opCtx, change, PhaseStart, func(callCtx context.Context) error {
@@ -502,13 +541,14 @@ func (s *Supervisor[S, E, T]) start(ctx context.Context, data T) Result[S, E] {
 // completed by Verify using the returned Attempt identifier.
 func (s *Supervisor[S, E, T]) Issue(ctx context.Context, event E, data T) (Result[S, E], error) {
 	result := s.issue(ctx, event, data)
-	s.completeResult(&result)
-	s.recordResult(RecordIssue, result)
-	s.closeJournalAfter(result)
 	return result, result.Err
 }
 
 func (s *Supervisor[S, E, T]) issue(ctx context.Context, event E, data T) Result[S, E] {
+	return s.finalize(RecordIssue, s.issueDecision(ctx, event, data))
+}
+
+func (s *Supervisor[S, E, T]) issueDecision(ctx context.Context, event E, data T) Result[S, E] {
 	if ctx == nil {
 		result := s.statusResult(PhaseNone, ErrNilContext)
 		result.Event = event
@@ -543,6 +583,19 @@ func (s *Supervisor[S, E, T]) issue(ctx context.Context, event E, data T) Result
 		return base
 	case ModeReady:
 	}
+	if s.operation != nil || s.recorderRunning || s.journalRunning || s.reporting != 0 {
+		base.Err = ErrBusy
+		base.stamp = s.stampLocked()
+		s.mu.Unlock()
+		return base
+	}
+	if !keycheck.Value(event) {
+		base.Phase = PhaseSelection
+		base.Err = ErrInvalidKey
+		base.stamp = s.stampLocked()
+		s.mu.Unlock()
+		return base
+	}
 	if _, known := s.machine.eventSet[event]; !known {
 		base.Phase = PhaseSelection
 		base.Err = ErrUnknownEvent
@@ -554,28 +607,30 @@ func (s *Supervisor[S, E, T]) issue(ctx context.Context, event E, data T) Result
 		change := s.currentChangeLocked()
 		change.Event = event
 		op, _ := s.beginOperationLocked(ctx, change, PhaseSelection)
+		base.Operation, base.owner = op.id, op
 		s.mu.Unlock()
-		defer s.operationReturned(op)
 		return s.latchResult(base, op, change, PhaseSelection, ErrCounterExhausted, false)
 	}
 	s.attempt++
 	attempt := Attempt[S, E]{
-		DefinitionID: s.machine.id,
-		ExecutionID:  s.executionID,
-		ID:           s.attempt,
-		Revision:     s.revision,
-		StartedAt:    s.clock.Now(),
-		From:         s.state,
-		Event:        event,
+		DefinitionID:  s.machine.id,
+		ExecutionID:   s.executionID,
+		IncarnationID: s.incarnationID,
+		ID:            s.attempt,
+		Revision:      s.revision,
+		StartedAt:     s.clock.Now(),
+		From:          s.state,
+		Event:         event,
 	}
 	change := Change[S, E]{Attempt: attempt, To: s.state}
+	base.Change = change
 	base.Attempt = attempt.ID
 	base.AttemptKey = attempt.Identifier()
 	op, opCtx := s.beginOperationLocked(ctx, change, PhasePrecondition)
 	base.StartedAt = op.startedAt
 	base.Operation = op.id
+	base.owner = op
 	s.mu.Unlock()
-	defer s.operationReturned(op)
 
 	for _, precondition := range s.machine.preconditions {
 		outcome := s.invoke(op, opCtx, change, PhasePrecondition, func(callCtx context.Context) error {
@@ -631,6 +686,7 @@ func (s *Supervisor[S, E, T]) issue(ctx context.Context, event E, data T) Result
 		}
 		return base
 	}
+	base.Change = change
 	base.Selected = true
 	base.TransitionID = change.TransitionID
 	base.To = change.To
@@ -690,61 +746,65 @@ func (s *Supervisor[S, E, T]) prepareIssue(
 	if journal == nil {
 		return nil
 	}
-	// Serialize with closure writes so the journal converges in decision
-	// order, and capture the in-doubt snapshot inside that serialization.
-	s.journalMu.Lock()
-	defer s.journalMu.Unlock()
-	s.mu.Lock()
-	snapshot := s.snapshotLocked()
-	s.mu.Unlock()
-	outcome := s.invoke(op, ctx, change, PhaseIssue, func(callCtx context.Context) error {
+	failure := s.deliverAdapter(ctx, &s.journalGate, op, true, func(callCtx context.Context) error {
+		s.mu.Lock()
+		if !s.ownsLocked(op) || s.mode != ModeExecuting {
+			fault := s.fault.snapshot()
+			s.mu.Unlock()
+			if fault != nil {
+				return fault
+			}
+			return ErrBusy
+		}
+		snapshot := s.snapshotLocked()
+		s.mu.Unlock()
 		return journal(callCtx, snapshot)
 	})
-	if outcome.err != nil {
-		return errors.Join(ErrJournal, outcome.err)
+	if failure != nil {
+		return errors.Join(ErrJournal, failure)
 	}
 	return nil
 }
 
-// closeJournalAfter writes the current Snapshot through the Journal when
-// result concluded a durable outcome: a commit, a freshly latched Fault, or a
-// completed recovery or adjudication.
+// closeJournalAfter includes startup and accepted refusals: their counters are
+// durable truth even when no state changes.
 func (s *Supervisor[S, E, T]) closeJournalAfter(result Result[S, E]) {
-	if !result.stamp.durable {
-		return
+	if result.stamp.durable {
+		s.closeJournal(result.owner)
 	}
-	s.closeJournal()
 }
 
-// closeJournal captures the current Snapshot under journal serialization and
-// writes it through the Journal with a bounded wait. Because every closure
-// re-captures state inside journalMu, writes are monotone in decision order
-// and the journal converges to the latest decision. A failure never rewrites
-// the completed outcome: it is retained in Status.JournalError, recorded as a
-// RecordJournalError, and the stale journal makes the next restoration
-// conservatively in-doubt.
-func (s *Supervisor[S, E, T]) closeJournal() {
-	s.journalMu.Lock()
-	defer s.journalMu.Unlock()
+// closeJournal keeps the Journal lease until the actual write ends. A timeout
+// bounds this call but cannot let an older write overtake a future preparation.
+// A busy or failed closure leaves visible health evidence without rewriting a
+// completed outcome; the latest durable snapshot may be clean or in doubt.
+func (s *Supervisor[S, E, T]) closeJournal(op *activeOperation[S, E]) {
 	s.mu.Lock()
-	journal := s.journal
-	snapshot := s.snapshotLocked()
-	timeout := s.recorderTimeout
+	journal, timeout := s.journal, s.recorderTimeout
 	s.mu.Unlock()
 	if journal == nil {
 		return
 	}
-	failure := deliverBounded(timeout, func(ctx context.Context) error {
-		return journal(ctx, snapshot)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	failure := s.deliverAdapter(ctx, &s.journalGate, op, true, func(callCtx context.Context) error {
+		s.mu.Lock()
+		snapshot := s.snapshotLocked()
+		s.mu.Unlock()
+		return journal(callCtx, snapshot)
 	})
+	message := ""
+	if failure != nil {
+		message = safeErrorText(failure)
+	}
 	s.mu.Lock()
+	s.journalError = message
 	if failure == nil {
-		s.journalError = ""
 		s.mu.Unlock()
 		return
 	}
-	s.journalError = failure.Error()
 	base := s.baseResultLocked()
+	base.owner = op
 	base.Err = errors.Join(ErrJournal, failure)
 	base.stamp = s.stampLocked()
 	s.mu.Unlock()
@@ -756,13 +816,14 @@ func (s *Supervisor[S, E, T]) closeJournal() {
 // Invariants, and Postconditions must all succeed before logical commit.
 func (s *Supervisor[S, E, T]) Verify(ctx context.Context, attempt AttemptID, data T) (Result[S, E], error) {
 	result := s.verify(ctx, attempt, data)
-	s.completeResult(&result)
-	s.recordResult(RecordVerify, result)
-	s.closeJournalAfter(result)
 	return result, result.Err
 }
 
 func (s *Supervisor[S, E, T]) verify(ctx context.Context, attempt AttemptID, data T) Result[S, E] {
+	return s.finalize(RecordVerify, s.verifyDecision(ctx, attempt, data))
+}
+
+func (s *Supervisor[S, E, T]) verifyDecision(ctx context.Context, attempt AttemptID, data T) Result[S, E] {
 	if ctx == nil {
 		return s.statusResult(PhaseVerify, ErrNilContext)
 	}
@@ -794,6 +855,12 @@ func (s *Supervisor[S, E, T]) verify(ctx context.Context, attempt AttemptID, dat
 		return base
 	case ModeAwaitingVerification:
 	}
+	if s.operation != nil || s.recorderRunning || s.journalRunning || s.reporting != 0 {
+		base.Err = ErrBusy
+		base.stamp = s.stampLocked()
+		s.mu.Unlock()
+		return base
+	}
 	if s.pending == nil {
 		base.Err = ErrNoPending
 		base.stamp = s.stampLocked()
@@ -822,8 +889,8 @@ func (s *Supervisor[S, E, T]) verify(ctx context.Context, attempt AttemptID, dat
 	if s.countersExhaustedLocked() {
 		change := s.pending.change
 		op, _ := s.beginOperationLocked(ctx, change, PhaseVerify)
+		base.Operation, base.owner = op.id, op
 		s.mu.Unlock()
-		defer s.operationReturned(op)
 		return s.latchResult(base, op, change, PhaseVerify, ErrCounterExhausted, true)
 	}
 	pending := *s.pending
@@ -840,8 +907,8 @@ func (s *Supervisor[S, E, T]) verify(ctx context.Context, attempt AttemptID, dat
 	op, opCtx := s.beginOperationLocked(ctx, change, PhaseVerify)
 	base.StartedAt = op.startedAt
 	base.Operation = op.id
+	base.owner = op
 	s.mu.Unlock()
-	defer s.operationReturned(op)
 
 	outcome := s.invoke(op, opCtx, change, PhaseVerify, func(callCtx context.Context) error {
 		return pending.transition.verify(callCtx, change, data)
@@ -866,6 +933,11 @@ func (s *Supervisor[S, E, T]) verify(ctx context.Context, attempt AttemptID, dat
 // Trip latches the first external or supervisory reason. It cancels the
 // current callback context and prevents logical commit, but cannot terminate a
 // callback that ignores cancellation or stop external hardware.
+//
+// Trip never calls an application's Error method. Ordinary errors.New and
+// fmt.Errorf messages retain their text; an uncaptured custom error is rendered
+// by type name. The original reason remains available through errors.Is/As.
+// This also keeps State/Event String methods off the fault-latching path.
 //
 // The fault latches before Trip returns, but the return itself can wait for
 // bounded lifecycle-record and journal-closure delivery — up to roughly two
@@ -894,6 +966,7 @@ func (s *Supervisor[S, E, T]) Trip(reason error) Fault[S, E] {
 	result.Operation = 0
 	if s.operation != nil {
 		result.Operation = s.operation.id
+		result.owner = s.operation
 	}
 	result.Phase = copy.Phase
 	result.Faulted = true
@@ -901,13 +974,16 @@ func (s *Supervisor[S, E, T]) Trip(reason error) Fault[S, E] {
 	result.Err = reason
 	result.stamp = s.stampLocked()
 	result.stamp.durable = fresh
+	s.reporting++
+	result.owner = s.operation
 	s.mu.Unlock()
+	defer s.reportingReturned()
 	if cancel != nil {
 		cancel()
 	}
 	s.completeResult(&result)
-	s.recordResult(RecordTrip, result)
 	s.closeJournalAfter(result)
+	s.recordResult(RecordTrip, result)
 	return copy
 }
 
@@ -919,14 +995,11 @@ func (s *Supervisor[S, E, T]) Trip(reason error) Fault[S, E] {
 // Fault.
 func (s *Supervisor[S, E, T]) Recover(ctx context.Context, data T) (Result[S, E], error) {
 	result := s.recover(ctx, data)
-	s.completeResult(&result)
-	s.recordResult(RecordRecover, result)
-	s.closeJournalAfter(result)
 	return result, result.Err
 }
 
 func (s *Supervisor[S, E, T]) recover(ctx context.Context, data T) Result[S, E] {
-	return s.adjudicate(ctx, Decision[S]{Outcome: AdjudicateRetain}, data, PhaseRecover)
+	return s.finalize(RecordRecover, s.adjudicateDecision(ctx, Decision[S]{Outcome: AdjudicateRetain}, data, PhaseRecover))
 }
 
 // Adjudicate resolves a latched Fault with an explicit, durable Decision.
@@ -945,14 +1018,11 @@ func (s *Supervisor[S, E, T]) recover(ctx context.Context, data T) Result[S, E] 
 // prior callback remains live, and a failed adjudication retains the original
 // first-cause Fault.
 func (s *Supervisor[S, E, T]) Adjudicate(ctx context.Context, decision Decision[S], data T) (Result[S, E], error) {
-	result := s.adjudicate(ctx, decision, data, PhaseAdjudicate)
-	s.completeResult(&result)
-	s.recordResult(RecordAdjudicate, result)
-	s.closeJournalAfter(result)
+	result := s.finalize(RecordAdjudicate, s.adjudicateDecision(ctx, decision, data, PhaseAdjudicate))
 	return result, result.Err
 }
 
-func (s *Supervisor[S, E, T]) adjudicate(
+func (s *Supervisor[S, E, T]) adjudicateDecision(
 	ctx context.Context, decision Decision[S], data T, phase Phase,
 ) Result[S, E] {
 	if ctx == nil {
@@ -962,13 +1032,14 @@ func (s *Supervisor[S, E, T]) adjudicate(
 	s.mu.Lock()
 	base := s.baseResultLocked()
 	base.Evidence = decision.Evidence
+	base.Adjudication = decision.Outcome
 	if s.mode != ModeFaulted {
 		base.Err = ErrNotFaulted
 		base.stamp = s.stampLocked()
 		s.mu.Unlock()
 		return base
 	}
-	if s.operation != nil {
+	if s.operation != nil || s.recorderRunning || s.journalRunning || s.reporting != 0 {
 		base.Faulted = true
 		base.Uncertain = s.fault.Uncertain
 		base.Err = ErrCallbackRunning
@@ -990,9 +1061,12 @@ func (s *Supervisor[S, E, T]) adjudicate(
 		base.Event = original.Event
 		base.TransitionID = original.TransitionID
 	case AdjudicateOverride:
+		if !keycheck.Value(decision.State) {
+			return s.refuseDecisionLocked(base, original, ErrInvalidKey)
+		}
 		if _, known := s.machine.stateIndex[decision.State]; !known {
 			return s.refuseDecisionLocked(base, original,
-				fmt.Errorf("%w: override state %v is undeclared", ErrInvalidDecision, decision.State))
+				fmt.Errorf("%w: override state is undeclared", ErrInvalidDecision))
 		}
 		target = decision.State
 	default:
@@ -1006,17 +1080,18 @@ func (s *Supervisor[S, E, T]) adjudicate(
 	change := s.currentChangeLocked()
 	change.To = target
 	if decision.Outcome == AdjudicateAdopt {
-		change.Attempt.ID = original.Attempt
-		change.Attempt.Event = original.Event
-		change.TransitionID = original.TransitionID
+		change = original.Change
+		base.Attempt = change.ID
+		base.AttemptKey = change.Identifier()
 	}
+	base.Change = change
 	op, opCtx := s.beginOperationLocked(ctx, change, phase)
 	base.StartedAt = op.startedAt
 	base.Operation = op.id
+	base.owner = op
 	proposed := s.snapshotLocked()
 	proposed.State = target
 	s.mu.Unlock()
-	defer s.operationReturned(op)
 
 	for _, reconcile := range s.machine.reconcile {
 		outcome := s.invoke(op, opCtx, change, phase, func(callCtx context.Context) error {
@@ -1053,7 +1128,7 @@ func (s *Supervisor[S, E, T]) adjudicate(
 	}
 	cancel := op.cancel
 	op.cancel = nil
-	if target != s.state {
+	if decision.Outcome != AdjudicateRetain {
 		s.state = target
 		s.revision++
 		base.Committed = true
@@ -1115,6 +1190,11 @@ func (s *Supervisor[S, E, T]) Status() Status[S, E] {
 		status.Pending = &pending
 		status.VerificationDeadline = s.pending.deadline
 	}
+	status.RecorderRunning = s.recorderRunning
+	status.JournalRunning = s.journalRunning
+	status.ReportingRunning = s.reporting != 0
+	status.CallbackRunning = status.CallbackRunning || s.recorderRunning || s.journalRunning
+	status.RecordsExhausted = s.nextRecord == math.MaxUint64
 	status.RecordsDropped = s.droppedRecords
 	status.RecorderFailures = s.recorderFailures
 	status.RecorderError = s.recorderError
@@ -1195,19 +1275,21 @@ func (s *Supervisor[S, E, T]) invoke(
 			} else {
 				outcome.completed = true
 			}
-			done <- outcome
 			var lateResult Result[S, E]
 			s.mu.Lock()
-			op.callbacks--
-			lateCause := op.revoked && op.abandoned && outcome.err != nil
-			if s.operation == op && op.returned && op.callbacks == 0 {
-				s.operation = nil
+			lateCause := op.abandoned && outcome.err != nil
+			if !lateCause {
+				s.callbackReturnedLocked(op)
+				done <- outcome
+				s.mu.Unlock()
+				return
 			}
 			if lateCause {
 				lateResult = resultFromChange(change)
 				lateResult.Operation = op.id
+				lateResult.owner = op
 				lateResult.Phase = phase
-				lateResult.Faulted = true
+				lateResult.Faulted = s.mode == ModeFaulted
 				lateResult.Uncertain = phase == PhaseIssue || phase == PhaseVerify || phase == PhasePostcondition
 				lateResult.Err = outcome.err
 				lateResult.stamp = s.stampLocked()
@@ -1217,8 +1299,12 @@ func (s *Supervisor[S, E, T]) invoke(
 				s.completeResult(&lateResult)
 				s.recordResult(RecordSecondaryCause, lateResult)
 			}
+			s.mu.Lock()
+			s.callbackReturnedLocked(op)
+			done <- outcome
+			s.mu.Unlock()
 		}()
-		outcome.err = callback(ctx)
+		outcome.err = captureErrorText(callback(ctx))
 		returned = true
 	}()
 
@@ -1252,9 +1338,20 @@ func (s *Supervisor[S, E, T]) invoke(
 			// the cleanup ran first the outcome arrived at the deadline and
 			// is deliberately not re-reported.
 			s.mu.Lock()
-			op.abandoned = true
-			s.mu.Unlock()
-			return callbackOutcome{err: contextFailure(ctx, ctx.Err())}
+			select {
+			case outcome := <-done:
+				s.mu.Unlock()
+				timeout := contextFailure(ctx, ctx.Err())
+				if outcome.err != nil {
+					outcome.err = errors.Join(outcome.err, timeout)
+					return outcome
+				}
+				return callbackOutcome{err: timeout, completed: outcome.completed}
+			default:
+				op.abandoned = true
+				s.mu.Unlock()
+				return callbackOutcome{err: contextFailure(ctx, ctx.Err())}
+			}
 		}
 	}
 }
@@ -1322,13 +1419,16 @@ func (s *Supervisor[S, E, T]) verificationExpired(attempt, timerVersion uint64) 
 	result.Err = fault
 	result.stamp = s.stampLocked()
 	result.stamp.durable = fresh
+	s.reporting++
+	result.owner = s.operation
 	s.mu.Unlock()
+	defer s.reportingReturned()
 	if cancel != nil {
 		cancel()
 	}
 	s.completeResult(&result)
-	s.recordResult(RecordVerificationExpired, result)
 	s.closeJournalAfter(result)
+	s.recordResult(RecordVerificationExpired, result)
 }
 
 func (s *Supervisor[S, E, T]) commit(
@@ -1433,6 +1533,7 @@ func (s *Supervisor[S, E, T]) finishReady(op *activeOperation[S, E], base *Resul
 	op.cancel = nil
 	s.mode = ModeReady
 	base.stamp = s.stampLocked()
+	base.stamp.durable = true
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -1506,8 +1607,10 @@ func (s *Supervisor[S, E, T]) latchLocked(
 			issuedAt = s.operation.issuedAt
 		}
 		s.fault = &faultRecord[S, E]{
+			Change:               change,
 			DefinitionID:         s.machine.id,
 			ExecutionID:          s.executionID,
+			IncarnationID:        change.IncarnationID,
 			Attempt:              change.ID,
 			Revision:             s.revision,
 			State:                s.state,
@@ -1519,7 +1622,7 @@ func (s *Supervisor[S, E, T]) latchLocked(
 			IssuedAt:             issuedAt,
 			VerificationDeadline: verificationDeadline,
 			OccurredAt:           s.clock.Now(),
-			CauseText:            fmt.Sprint(cause),
+			CauseText:            safeErrorText(cause),
 			Cause:                cause,
 		}
 	}
@@ -1540,33 +1643,36 @@ func (s *Supervisor[S, E, T]) latchLocked(
 
 func (s *Supervisor[S, E, T]) snapshotLocked() Snapshot[S, E] {
 	snapshot := Snapshot[S, E]{
-		Version:      SnapshotVersion,
-		DefinitionID: s.machine.id,
-		ExecutionID:  s.executionID,
-		Restarts:     s.restarts,
-		State:        s.state,
-		Revision:     s.revision,
-		Attempt:      s.attempt,
-		Records:      s.nextRecord,
-		RecordedAt:   s.clock.Now(),
+		Version:       SnapshotVersion,
+		DefinitionID:  s.machine.id,
+		ExecutionID:   s.executionID,
+		IncarnationID: s.incarnationID,
+		Restarts:      s.restarts,
+		State:         s.state,
+		Revision:      s.revision,
+		Attempt:       s.attempt,
+		Records:       s.nextRecord,
+		RecordedAt:    s.clock.Now(),
 	}
 	if s.pending != nil {
 		snapshot.InDoubt = true
 		snapshot.Uncertain = true
 		snapshot.Pending = &PendingSnapshot[S, E]{
 			Attempt: s.pending.change.Identifier(), Revision: s.pending.change.Revision,
-			From: s.pending.change.From, Event: s.pending.change.Event,
+			StartedAt: s.pending.change.StartedAt,
+			From:      s.pending.change.From, Event: s.pending.change.Event,
 			TransitionID: s.pending.change.TransitionID, To: s.pending.change.To,
 			IssuedAt: s.pending.issuedAt, VerificationDeadline: s.pending.deadline,
 		}
 	}
-	if s.operation != nil && !s.operation.issuedAt.IsZero() {
+	if s.operation != nil && s.mode == ModeExecuting && !s.operation.issuedAt.IsZero() {
 		snapshot.InDoubt = true
 		snapshot.Uncertain = true
 		if snapshot.Pending == nil && s.operation.change.ID != 0 {
 			snapshot.Pending = &PendingSnapshot[S, E]{
 				Attempt: s.operation.change.Identifier(), Revision: s.operation.change.Revision,
-				From: s.operation.change.From, Event: s.operation.change.Event,
+				StartedAt: s.operation.change.StartedAt,
+				From:      s.operation.change.From, Event: s.operation.change.Event,
 				TransitionID: s.operation.change.TransitionID, To: s.operation.change.To,
 				IssuedAt: s.operation.issuedAt,
 			}
@@ -1580,8 +1686,9 @@ func (s *Supervisor[S, E, T]) snapshotLocked() Snapshot[S, E] {
 		if snapshot.Pending == nil && !s.fault.IssuedAt.IsZero() {
 			snapshot.InDoubt = true
 			snapshot.Pending = &PendingSnapshot[S, E]{
-				Attempt:  AttemptID{ExecutionID: s.fault.ExecutionID, Sequence: s.fault.Attempt},
-				Revision: s.fault.Revision, From: s.fault.State, Event: s.fault.Event,
+				Attempt:  AttemptID{ExecutionID: s.fault.ExecutionID, IncarnationID: s.fault.IncarnationID, Sequence: s.fault.Attempt},
+				Revision: s.fault.Change.Revision, From: s.fault.State, Event: s.fault.Event,
+				StartedAt:    s.fault.Change.StartedAt,
 				TransitionID: s.fault.TransitionID, To: s.fault.To,
 				IssuedAt: s.fault.IssuedAt, VerificationDeadline: s.fault.VerificationDeadline,
 			}
@@ -1593,11 +1700,12 @@ func (s *Supervisor[S, E, T]) snapshotLocked() Snapshot[S, E] {
 func (s *Supervisor[S, E, T]) currentChangeLocked() Change[S, E] {
 	return Change[S, E]{
 		Attempt: Attempt[S, E]{
-			DefinitionID: s.machine.id,
-			ExecutionID:  s.executionID,
-			ID:           s.attempt,
-			Revision:     s.revision,
-			From:         s.state,
+			DefinitionID:  s.machine.id,
+			ExecutionID:   s.executionID,
+			IncarnationID: s.incarnationID,
+			ID:            s.attempt,
+			Revision:      s.revision,
+			From:          s.state,
 		},
 		To: s.state,
 	}
@@ -1605,13 +1713,14 @@ func (s *Supervisor[S, E, T]) currentChangeLocked() Change[S, E] {
 
 func (s *Supervisor[S, E, T]) baseResultLocked() Result[S, E] {
 	return Result[S, E]{
-		DefinitionID: s.machine.id,
-		ExecutionID:  s.executionID,
-		Attempt:      s.attempt,
-		AttemptKey:   AttemptID{ExecutionID: s.executionID, Sequence: s.attempt},
-		Revision:     s.revision,
-		From:         s.state,
-		To:           s.state,
+		DefinitionID:  s.machine.id,
+		ExecutionID:   s.executionID,
+		IncarnationID: s.incarnationID,
+		Attempt:       s.attempt,
+		AttemptKey:    AttemptID{ExecutionID: s.executionID, IncarnationID: s.incarnationID, Sequence: s.attempt},
+		Revision:      s.revision,
+		From:          s.state,
+		To:            s.state,
 	}
 }
 
@@ -1640,17 +1749,19 @@ func (s *Supervisor[S, E, T]) completeResult(result *Result[S, E]) {
 
 func resultFromChange[S, E comparable](change Change[S, E]) Result[S, E] {
 	return Result[S, E]{
-		DefinitionID: change.DefinitionID,
-		ExecutionID:  change.ExecutionID,
-		Attempt:      change.ID,
-		AttemptKey:   change.Identifier(),
-		Revision:     change.Revision,
-		StartedAt:    change.StartedAt,
-		From:         change.From,
-		Event:        change.Event,
-		TransitionID: change.TransitionID,
-		To:           change.To,
-		Selected:     change.TransitionID != "",
+		DefinitionID:  change.DefinitionID,
+		ExecutionID:   change.ExecutionID,
+		IncarnationID: change.IncarnationID,
+		Change:        change,
+		Attempt:       change.ID,
+		AttemptKey:    change.Identifier(),
+		Revision:      change.Revision,
+		StartedAt:     change.StartedAt,
+		From:          change.From,
+		Event:         change.Event,
+		TransitionID:  change.TransitionID,
+		To:            change.To,
+		Selected:      change.TransitionID != "",
 	}
 }
 

@@ -2,7 +2,6 @@ package queued
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/open-ships/statemachine"
@@ -12,13 +11,7 @@ import (
 func copyObservers[S, E comparable, T any](
 	observers []statemachine.Observer[S, E, T],
 ) []statemachine.Observer[S, E, T] {
-	result := make([]statemachine.Observer[S, E, T], 0, len(observers))
-	for _, observer := range observers {
-		if observer != nil {
-			result = append(result, observer)
-		}
-	}
-	return result
+	return internalobserver.Copy(observers)
 }
 
 func deliverObservations[S, E comparable, T any](
@@ -27,35 +20,9 @@ func deliverObservations[S, E comparable, T any](
 	observations []statemachine.Observation[S, E],
 	data T,
 ) error {
-	if len(observers) == 0 || len(observations) == 0 {
-		return nil
-	}
-	var failures []error
-	for _, observation := range observations {
-		for index, observer := range observers {
-			if err := callObserver(index, observer, ctx, observation, data); err != nil {
-				failures = append(failures, err)
-			}
-		}
-	}
-	return errors.Join(failures...)
-}
-
-func callObserver[S, E comparable, T any](
-	index int,
-	observer statemachine.Observer[S, E, T],
-	ctx context.Context,
-	observation statemachine.Observation[S, E],
-	data T,
-) error {
-	failure := internalobserver.Call(func() { observer(ctx, observation, data) })
-	if failure == nil {
-		return nil
-	}
-	return &statemachine.ObserverError{
-		Observer: index, Seq: observation.Seq, Value: failure.Value,
-		Stack: failure.Stack, Stopped: failure.Stopped,
-	}
+	return internalobserver.Deliver(observers, ctx, len(observations), func(index int) (statemachine.Observation[S, E], uint64) {
+		return observations[index], observations[index].Seq
+	}, data)
 }
 
 func deliverTransitionObservations[S, E comparable, T any](

@@ -22,15 +22,15 @@ func TestConstructorAndLimitErrors(t *testing.T) {
 	if _, err := restoreUnjournaled(valid, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: valid.ID(), State: testIdle}, Limits{}); !errors.Is(err, ErrInvalidLimits) {
 		t.Fatalf("Restore limits = %v", err)
 	}
-	if _, err := restoreUnjournaled(valid, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: valid.ID(), ExecutionID: "execution", State: testIdle, Revision: math.MaxUint64}, limits()); !errors.Is(err, ErrCounterExhausted) {
+	if _, err := restoreUnjournaled(valid, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: valid.ID(), ExecutionID: "execution", IncarnationID: "stored-incarnation", State: testIdle, Revision: math.MaxUint64}, limits()); !errors.Is(err, ErrCounterExhausted) {
 		t.Fatalf("Restore counter = %v", err)
 	}
 	invalidPending := Snapshot[testState, testEvent]{
 		Version:      SnapshotVersion,
-		DefinitionID: valid.ID(), ExecutionID: "execution", State: testIdle,
+		DefinitionID: valid.ID(), ExecutionID: "execution", IncarnationID: "stored-incarnation", State: testIdle,
 		Attempt: 1, InDoubt: true,
 		Pending: &PendingSnapshot[testState, testEvent]{
-			Attempt: AttemptID{ExecutionID: "execution", Sequence: 1},
+			Attempt: AttemptID{ExecutionID: "execution", IncarnationID: "stored-incarnation", Sequence: 1},
 			From:    testIdle, Event: testStop, TransitionID: "unknown", To: testRunning,
 		},
 	}

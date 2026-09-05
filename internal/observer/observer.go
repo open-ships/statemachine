@@ -1,5 +1,5 @@
-// Package observer contains the shared failure-containment boundary used by
-// every observation-delivery adapter in this module.
+// Package observer owns typed, ordered observation delivery and callback
+// failure containment for the execution adapters in this module.
 package observer
 
 import "runtime/debug"

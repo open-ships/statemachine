@@ -15,24 +15,26 @@ import (
 // before preconditions run, so refusals and faults retain the same identifier
 // the caller received. StartedAt uses the Supervisor Clock.
 type Attempt[S, E comparable] struct {
-	DefinitionID string
-	ExecutionID  string
-	ID           uint64
-	Revision     uint64
-	StartedAt    time.Time
-	From         S
-	Event        E
+	DefinitionID  string
+	ExecutionID   string
+	IncarnationID string
+	ID            uint64
+	Revision      uint64
+	StartedAt     time.Time
+	From          S
+	Event         E
 }
 
 // AttemptID is a non-reusable execution-scoped Verification identifier.
 type AttemptID struct {
-	ExecutionID string
-	Sequence    uint64
+	ExecutionID   string
+	IncarnationID string
+	Sequence      uint64
 }
 
 // Identifier returns the durable identity callers must present to Verify.
 func (a Attempt[S, E]) Identifier() AttemptID {
-	return AttemptID{ExecutionID: a.ExecutionID, Sequence: a.ID}
+	return AttemptID{ExecutionID: a.ExecutionID, IncarnationID: a.IncarnationID, Sequence: a.ID}
 }
 
 // Change identifies the transition selected for an Attempt.
@@ -181,6 +183,31 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Machine[S
 	}
 	if unsafeKeyType {
 		return nil, errors.Join(problems...)
+	}
+	// Validate values before using them as map keys: comparable NaNs are
+	// insertable but can never be found again, including nested complex NaNs.
+	if !keycheck.Value(definition.Initial) {
+		return nil, ErrInvalidKey
+	}
+	for _, state := range definition.States {
+		if !keycheck.Value(state.Name) {
+			return nil, ErrInvalidKey
+		}
+		for _, event := range state.Refuse {
+			if !keycheck.Value(event) {
+				return nil, ErrInvalidKey
+			}
+		}
+	}
+	for _, event := range definition.Events {
+		if !keycheck.Value(event) {
+			return nil, ErrInvalidKey
+		}
+	}
+	for _, transition := range definition.Transitions {
+		if !keycheck.Value(transition.From) || !keycheck.Value(transition.Event) || !keycheck.Value(transition.To) {
+			return nil, ErrInvalidKey
+		}
 	}
 	if len(definition.States) == 0 {
 		problems = append(problems, errors.New("supervised: definition has no states"))

@@ -408,10 +408,10 @@ func TestRestoreRequiresMatchingDefinitionAndStartupReconciliation(t *testing.T)
 	if _, err := restoreUnjournaled(machine, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: "other", State: testIdle}, limits()); !errors.Is(err, ErrDefinitionMismatch) {
 		t.Fatalf("definition mismatch = %v", err)
 	}
-	if _, err := restoreUnjournaled(machine, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: machine.ID(), ExecutionID: "execution", State: testOther}, limits()); !errors.Is(err, ErrUnknownState) {
+	if _, err := restoreUnjournaled(machine, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: machine.ID(), ExecutionID: "execution", IncarnationID: "stored-incarnation", State: testOther}, limits()); !errors.Is(err, ErrUnknownState) {
 		t.Fatalf("unknown state = %v", err)
 	}
-	supervisor, err := restoreUnjournaled(machine, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: machine.ID(), ExecutionID: "execution", State: testRunning, Revision: 9, Attempt: 7}, limits())
+	supervisor, err := restoreUnjournaled(machine, Snapshot[testState, testEvent]{Version: SnapshotVersion, DefinitionID: machine.ID(), ExecutionID: "execution", IncarnationID: "stored-incarnation", State: testRunning, Revision: 9, Attempt: 7}, limits())
 	if err != nil {
 		t.Fatal(err)
 	}

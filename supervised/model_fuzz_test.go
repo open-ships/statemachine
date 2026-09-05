@@ -3,6 +3,7 @@ package supervised
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 // failure programmed for the current step.
 type fuzzIO struct {
 	issueErr     error
+	guardErr     error
 	verifyErr    error
 	invariantErr error
 	reconcileErr error
@@ -25,6 +27,8 @@ type fuzzIO struct {
 
 var (
 	errFuzzIssue     = errors.New("fuzz: issue refused")
+	errFuzzGuard     = errors.New("fuzz: guard refused")
+	errFuzzJournal   = errors.New("fuzz: journal write rejected")
 	errFuzzVerify    = errors.New("fuzz: verification failed")
 	errFuzzInvariant = errors.New("fuzz: invariant violated")
 	errFuzzReconcile = errors.New("fuzz: reconciliation failed")
@@ -121,6 +125,9 @@ func checkStructure(
 	if snapshot.Version != SnapshotVersion {
 		t.Fatalf("snapshot version = %d", snapshot.Version)
 	}
+	if snapshot.ExecutionID == "" || snapshot.IncarnationID == "" {
+		t.Fatalf("snapshot has an empty execution identity: %+v", snapshot)
+	}
 	if snapshot.InDoubt != (snapshot.Pending != nil) {
 		t.Fatalf("snapshot in-doubt/pending disagree: %+v", snapshot)
 	}
@@ -133,8 +140,9 @@ func checkStructure(
 		if index > 0 && records[index-1].Seq >= record.Seq {
 			t.Fatalf("record seq not strictly increasing: %d then %d", records[index-1].Seq, record.Seq)
 		}
-		if record.ExecutionID != snapshot.ExecutionID {
-			t.Fatalf("record execution identity %q != %q", record.ExecutionID, snapshot.ExecutionID)
+		if record.Seq == 0 || record.ExecutionID != snapshot.ExecutionID ||
+			record.IncarnationID != snapshot.IncarnationID || record.Restarts != snapshot.Restarts {
+			t.Fatalf("record identity does not match its execution: %+v vs %+v", record, snapshot)
 		}
 		if record.Seq > lastSeq {
 			lastSeq = record.Seq
@@ -372,7 +380,7 @@ func FuzzSupervisorModel(f *testing.F) {
 					case AdjudicateOverride:
 						target = decision.State
 					}
-					if target != model.state {
+					if decision.Outcome != AdjudicateRetain {
 						model.state = target
 						model.revision++
 					}
@@ -395,22 +403,32 @@ func FuzzSupervisorModel(f *testing.F) {
 	})
 }
 
-// lastSnapshotJournal is a goroutine-safe Journal retaining the latest write,
-// like an idempotent single-slot durable store.
+// lastSnapshotJournal models durable application storage outside a Supervisor
+// lifetime. A rejected write leaves the old image available for repeated restores.
 type lastSnapshotJournal struct {
-	mu    sync.Mutex
-	wrote bool
-	last  Snapshot[testState, testEvent]
+	mu     sync.Mutex
+	wrote  bool
+	reject bool
+	last   Snapshot[testState, testEvent]
 }
 
 func (j *lastSnapshotJournal) journal() Journal[testState, testEvent] {
 	return func(_ context.Context, snapshot Snapshot[testState, testEvent]) error {
 		j.mu.Lock()
 		defer j.mu.Unlock()
+		if j.reject {
+			return errFuzzJournal
+		}
 		j.wrote = true
 		j.last = snapshot
 		return nil
 	}
+}
+
+func (j *lastSnapshotJournal) rejectWrites(reject bool) {
+	j.mu.Lock()
+	j.reject = reject
+	j.mu.Unlock()
 }
 
 func (j *lastSnapshotJournal) snapshot() (Snapshot[testState, testEvent], bool) {
@@ -419,46 +437,132 @@ func (j *lastSnapshotJournal) snapshot() (Snapshot[testState, testEvent], bool) 
 	return j.last, j.wrote
 }
 
-// FuzzSupervisorRestartModel simulates power loss at arbitrary points: the
-// process dies, the last durable Journal snapshot is all that survives, and a
-// restored Supervisor must fault iff the snapshot was in doubt or faulted,
-// continue the (ExecutionID, Restarts, Seq) identity line, and reach Ready
-// again through reconciliation or adjudication.
+// restartAudit models independent application and controller histories. It
+// survives every restore and never seeds its identity sets from the Journal or
+// the Supervisor's bounded Records view. A rejected durable closure cannot erase
+// identities that an external callback has already observed.
+type restartAudit struct {
+	mu       sync.Mutex
+	records  map[restartRecordID]bool
+	attempts map[AttemptID]bool
+	issued   map[AttemptID]bool
+	problem  error
+}
+
+type restartRecordID struct {
+	execution   string
+	incarnation string
+	seq         uint64
+}
+
+func (a *restartAudit) record(_ context.Context, record Record[testState, testEvent]) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.records == nil {
+		a.records = make(map[restartRecordID]bool)
+	}
+	id := restartRecordID{record.ExecutionID, record.IncarnationID, record.Seq}
+	if id.execution == "" || id.incarnation == "" || id.seq == 0 || a.records[id] {
+		a.problem = fmt.Errorf("invalid or reused external Record identity: %+v", id)
+	}
+	a.records[id] = true
+	return nil
+}
+
+func (a *restartAudit) attempt(id AttemptID, issued bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.attempts == nil {
+		a.attempts = make(map[AttemptID]bool)
+		a.issued = make(map[AttemptID]bool)
+	}
+	seen := a.attempts
+	if issued {
+		seen = a.issued
+		if !a.attempts[id] {
+			a.problem = fmt.Errorf("controller saw an unaccepted Attempt: %+v", id)
+		}
+	}
+	if id.ExecutionID == "" || id.IncarnationID == "" || id.Sequence == 0 || seen[id] {
+		a.problem = fmt.Errorf("invalid or reused external Attempt identity (issued=%v): %+v", issued, id)
+	}
+	seen[id] = true
+}
+
+func (a *restartAudit) check(t *testing.T) {
+	t.Helper()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.problem != nil {
+		t.Fatal(a.problem)
+	}
+}
+
+// FuzzSupervisorRestartModel keeps independent Recorder, accepted Attempt,
+// controller Issue, and Journal histories across arbitrary power-loss points.
+// Clean startup can fail reconciliation or its Journal closure; guard-refused
+// Attempts can also outlive the latest durable image. Every new incarnation
+// must remain distinct even when the same stale image is restored repeatedly.
 func FuzzSupervisorRestartModel(f *testing.F) {
 	f.Add([]byte{0, 0, 2, 0, 255, 0})
 	f.Add([]byte{0, 0, 255, 1, 0, 0, 2, 0, 255, 2})
 	f.Add([]byte{0, 8, 255, 0, 255, 1, 255, 2, 255, 3})
 	f.Add([]byte{0, 0, 2, 16, 255, 3, 0, 0, 255, 0})
+	f.Add([]byte{255, 4, 255, 4, 255, 0})              // clean startup cannot save its new incarnation
+	f.Add([]byte{255, 12, 255, 12, 255, 0})            // failed startup cannot save its fault
+	f.Add([]byte{0, 16, 255, 4, 0, 16, 255, 4, 0, 16}) // guard refusals before stale restores
 	f.Fuzz(func(t *testing.T, program []byte) {
 		if len(program) > 48 {
 			program = program[:48]
 		}
-		machine := MustCompile(fuzzDefinition())
+		audit := &restartAudit{}
+		definition := fuzzDefinition()
+		definition.Preconditions[0] = func(_ context.Context, attempt Attempt[testState, testEvent], _ *fuzzIO) error {
+			audit.attempt(attempt.Identifier(), false)
+			return nil
+		}
+		definition.Transitions[0].Guard = func(_ context.Context, _ Change[testState, testEvent], io *fuzzIO) error {
+			return io.guardErr
+		}
+		definition.Transitions[0].Issue = func(_ context.Context, change Change[testState, testEvent], io *fuzzIO) error {
+			audit.attempt(change.Identifier(), true)
+			return io.issueErr
+		}
+		machine := MustCompile(definition)
 		store := &lastSnapshotJournal{}
 		options := func() Options[testState, testEvent] {
 			return Options[testState, testEvent]{
-				Limits:  Limits{OperationTimeout: time.Second, VerificationTimeout: time.Minute},
-				Journal: store.journal(),
+				Limits:  Limits{OperationTimeout: time.Second, VerificationTimeout: time.Minute, MaxRecords: 8},
+				Journal: store.journal(), Recorder: audit.record,
+				// A dead process cannot later dispatch its verification timer.
+				Clock: newFakeClock(),
 			}
 		}
 		supervisor, err := NewWithOptions(machine, options())
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := supervisor.Start(context.Background(), &fuzzIO{}); err != nil {
+		ctx := context.Background()
+		// The application checkpoints the lineage before any startup callback.
+		if err := store.journal()(ctx, supervisor.Snapshot()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := supervisor.Start(ctx, &fuzzIO{}); err != nil {
 			t.Fatal(err)
 		}
 		executionID := supervisor.Snapshot().ExecutionID
-		restarts := uint64(0)
-		ctx := context.Background()
+		incarnations := map[string]bool{supervisor.Snapshot().IncarnationID: true}
+		audit.check(t)
 
 		for index := 0; index < len(program)-1; index += 2 {
-			command := program[index]
-			behavior := program[index+1]
+			command, behavior := program[index], program[index+1]
+			store.rejectWrites(behavior&4 != 0)
 			if command != 255 {
-				// Ordinary operation between crashes.
 				io := ioForStep(behavior)
-				switch command % 4 {
+				if behavior&16 != 0 {
+					io.guardErr = errFuzzGuard
+				}
+				switch command % 6 {
 				case 0:
 					_, _ = supervisor.Issue(ctx, testStart, io)
 				case 1:
@@ -469,59 +573,74 @@ func FuzzSupervisorRestartModel(f *testing.F) {
 					}
 				case 3:
 					_, _ = supervisor.Recover(ctx, io)
+				case 4:
+					_, _ = supervisor.Start(ctx, io)
+				case 5:
+					_ = supervisor.Trip(errTrip)
 				}
+				audit.check(t)
+				checkStructure(t, supervisor, 8, 0)
 				continue
 			}
 
-			// Power loss: only the last journaled snapshot survives.
+			// Only the Journal image survives locally; all external audit sets do.
 			durable, wrote := store.snapshot()
 			if !wrote {
-				continue
+				t.Fatal("birth checkpoint was lost")
 			}
 			restored, err := RestoreWithOptions(machine, durable, options())
 			if err != nil {
 				t.Fatalf("restore from %+v = %v", durable, err)
 			}
-			restarts = durable.Restarts + 1
 			status := restored.Status()
-			if status.Restarts != restarts {
-				t.Fatalf("restarts = %d, want %d", status.Restarts, restarts)
+			if status.Restarts != durable.Restarts+1 {
+				t.Fatalf("restarts = %d, want %d", status.Restarts, durable.Restarts+1)
 			}
-			if snapshot := restored.Snapshot(); snapshot.ExecutionID != executionID {
-				t.Fatalf("execution identity changed across restart: %q != %q", snapshot.ExecutionID, executionID)
+			snapshot := restored.Snapshot()
+			if snapshot.ExecutionID != executionID || snapshot.IncarnationID == "" || incarnations[snapshot.IncarnationID] {
+				t.Fatalf("invalid restored identity: %+v", snapshot)
 			}
-			wantFaulted := durable.InDoubt || durable.Faulted
-			if (status.Mode == ModeFaulted) != wantFaulted {
+			incarnations[snapshot.IncarnationID] = true
+			if (status.Mode == ModeFaulted) != (durable.InDoubt || durable.Faulted) {
 				t.Fatalf("restored mode = %v for snapshot %+v", status.Mode, durable)
 			}
-
+			io := &fuzzIO{}
+			if behavior&8 != 0 {
+				io.reconcileErr = errFuzzReconcile
+			}
 			if status.Mode == ModeFaulted {
 				fault := status.Fault
 				decision := Decision[testState]{Outcome: AdjudicateRetain, Evidence: "fuzz restart"}
 				if behavior%2 == 1 && fault != nil && fault.TransitionID != "" && !fault.IssuedAt.IsZero() {
 					decision.Outcome = AdjudicateAdopt
 				}
-				result, err := restored.Adjudicate(ctx, decision, &fuzzIO{})
-				if err != nil {
-					t.Fatalf("adjudicate after restart = %+v, %v", result, err)
+				result, err := restored.Adjudicate(ctx, decision, io)
+				if io.reconcileErr != nil {
+					if !errors.Is(err, errFuzzReconcile) || !result.Faulted {
+						t.Fatalf("failed reconciliation after restart = %+v, %v", result, err)
+					}
+				} else {
+					if err != nil || result.Evidence != "fuzz restart" {
+						t.Fatalf("adjudicate after restart = %+v, %v", result, err)
+					}
+					if decision.Outcome == AdjudicateAdopt && restored.Snapshot().State != fault.To {
+						t.Fatalf("adopt did not commit destination: %+v", restored.Snapshot())
+					}
 				}
-				if decision.Outcome == AdjudicateAdopt && restored.Snapshot().State != fault.To {
-					t.Fatalf("adopt did not commit destination: %+v", restored.Snapshot())
+			} else {
+				result, err := restored.Start(ctx, io)
+				if io.reconcileErr != nil {
+					if !errors.Is(err, errFuzzReconcile) || !result.Faulted {
+						t.Fatalf("failed clean startup = %+v, %v", result, err)
+					}
+				} else if err != nil {
+					t.Fatalf("start after clean restore = %v", err)
 				}
-				if result.Evidence != "fuzz restart" {
-					t.Fatalf("adjudication evidence lost: %+v", result)
-				}
-			} else if _, err := restored.Start(ctx, &fuzzIO{}); err != nil {
-				t.Fatalf("start after clean restore = %v", err)
 			}
-
-			// New records must extend, never reuse, the durable identity line.
+			audit.check(t)
 			for _, record := range restored.Records() {
-				if record.Restarts != restarts {
-					t.Fatalf("record incarnation %d, want %d", record.Restarts, restarts)
-				}
-				if record.Seq <= durable.Records {
-					t.Fatalf("record identity reused after restart: seq %d vs high-water %d", record.Seq, durable.Records)
+				if record.IncarnationID != snapshot.IncarnationID || record.Restarts != durable.Restarts+1 || record.Seq <= durable.Records {
+					t.Fatalf("restored Record does not extend its image: %+v (image %+v)", record, durable)
 				}
 			}
 			if restored.Snapshot().Revision < durable.Revision {
@@ -689,37 +808,35 @@ func FuzzConcurrentSupervisor(f *testing.F) {
 }
 
 // FuzzSnapshotRestore mutates otherwise-valid Snapshots field by field.
-// Restore must never panic: every input is either restored with identity
-// preserved or refused with a documented sentinel error.
+// Accepted inputs must survive real public lifecycle operations, including
+// counter-exhaustion refusals, rather than only a structural round trip.
 func FuzzSnapshotRestore(f *testing.F) {
 	f.Add(uint8(0), uint64(0), uint64(0), uint64(0), false, false, "execution")
 	f.Add(uint8(1), uint64(3), uint64(2), uint64(9), false, false, "execution")
 	f.Add(uint8(2), uint64(1), uint64(1), uint64(1), false, true, "execution")
 	f.Add(uint8(7), uint64(5), uint64(5), uint64(5), true, false, "execution")
+	f.Add(uint8(0), uint64(5), uint64(5), uint64(5), false, true, "execution")
+	f.Add(uint8(0), uint64(math.MaxUint64-1), uint64(5), uint64(5), true, false, "execution")
+	f.Add(uint8(0), uint64(5), uint64(math.MaxUint64), uint64(5), false, false, "execution")
+	f.Add(uint8(0), uint64(5), uint64(5), uint64(math.MaxUint64-17), true, false, "execution")
 	f.Fuzz(func(t *testing.T, mutation uint8, revision, attempt, records uint64, faulted, inDoubt bool, executionID string) {
 		machine := MustCompile(fuzzDefinition())
 		snapshot := Snapshot[testState, testEvent]{
-			Version:      SnapshotVersion,
-			DefinitionID: machine.ID(),
-			ExecutionID:  executionID,
-			State:        testIdle,
-			Revision:     revision,
-			Attempt:      attempt,
-			Records:      records,
-			Faulted:      faulted,
-			RecordedAt:   time.Unix(1754000000, 0),
+			Version: SnapshotVersion, DefinitionID: machine.ID(),
+			ExecutionID: executionID, IncarnationID: "stored-incarnation",
+			State: testIdle, Revision: revision, Attempt: attempt, Records: records,
+			Faulted: faulted, RecordedAt: time.Unix(1754000000, 0),
 		}
 		if inDoubt {
 			snapshot.InDoubt = true
 			snapshot.Uncertain = true
 			snapshot.Pending = &PendingSnapshot[testState, testEvent]{
-				Attempt:  AttemptID{ExecutionID: executionID, Sequence: attempt},
+				Attempt:  AttemptID{ExecutionID: executionID, IncarnationID: snapshot.IncarnationID, Sequence: attempt},
 				Revision: revision, From: testIdle, Event: testStart,
-				TransitionID: "start", To: testRunning,
-				IssuedAt: snapshot.RecordedAt,
+				TransitionID: "start", To: testRunning, IssuedAt: snapshot.RecordedAt,
 			}
 		}
-		switch mutation % 8 {
+		switch mutation % 10 {
 		case 1:
 			snapshot.Version = SnapshotVersion + 1
 		case 2:
@@ -738,11 +855,18 @@ func FuzzSnapshotRestore(f *testing.F) {
 			}
 		case 7:
 			snapshot.Restarts = math.MaxUint64
+		case 8:
+			snapshot.IncarnationID = ""
+		case 9:
+			if snapshot.Pending != nil {
+				snapshot.Pending.Attempt.IncarnationID = ""
+			}
 		}
 
+		audit := &restartAudit{}
 		restored, err := RestoreWithOptions(machine, snapshot, Options[testState, testEvent]{
-			Limits:      Limits{OperationTimeout: time.Second, VerificationTimeout: time.Second},
-			Unjournaled: true,
+			Limits:      Limits{OperationTimeout: time.Second, VerificationTimeout: time.Second, MaxRecords: 16},
+			Unjournaled: true, Recorder: audit.record,
 		})
 		if err != nil {
 			for _, sentinel := range []error{
@@ -758,8 +882,57 @@ func FuzzSnapshotRestore(f *testing.F) {
 		roundTrip := restored.Snapshot()
 		if roundTrip.ExecutionID != snapshot.ExecutionID || roundTrip.State != snapshot.State ||
 			roundTrip.Revision != snapshot.Revision || roundTrip.Attempt != snapshot.Attempt ||
-			roundTrip.Restarts != snapshot.Restarts+1 || roundTrip.Records != snapshot.Records {
+			roundTrip.Restarts != snapshot.Restarts+1 || roundTrip.Records != snapshot.Records ||
+			roundTrip.IncarnationID == "" || roundTrip.IncarnationID == snapshot.IncarnationID {
 			t.Fatalf("restore identity mismatch: %+v vs %+v", roundTrip, snapshot)
+		}
+		defer func() {
+			audit.check(t)
+			checkStructure(t, restored, 16, snapshot.Records)
+			after := restored.Snapshot()
+			if after.Revision < snapshot.Revision || after.Attempt < snapshot.Attempt || after.Records < snapshot.Records {
+				t.Fatalf("public operation wrapped a restored counter: %+v vs %+v", after, snapshot)
+			}
+		}()
+		ctx := context.Background()
+		if snapshot.InDoubt || snapshot.Faulted {
+			if _, err := restored.Start(ctx, &fuzzIO{}); err == nil {
+				t.Fatal("faulted restoration started without recovery")
+			}
+			result, err := restored.Recover(ctx, &fuzzIO{})
+			if errors.Is(err, ErrCounterExhausted) && result.Faulted && !result.Committed {
+				return // the refused Start may consume the last admission headroom
+			}
+			if err != nil || result.Faulted || result.Committed {
+				t.Fatalf("restored recovery = %+v, %v", result, err)
+			}
+		} else {
+			if result, err := restored.Start(ctx, &fuzzIO{}); err != nil {
+				t.Fatalf("restored startup = %+v, %v", result, err)
+			}
+			if _, err := restored.Recover(ctx, &fuzzIO{}); !errors.Is(err, ErrNotFaulted) {
+				t.Fatalf("recovery of clean execution = %v", err)
+			}
+		}
+		audit.check(t)
+		issued, err := restored.Issue(ctx, testStart, &fuzzIO{})
+		if err != nil {
+			if !errors.Is(err, ErrCounterExhausted) || issued.IssueCompleted {
+				t.Fatalf("restored Issue = %+v, %v", issued, err)
+			}
+		} else {
+			if issued.AttemptKey.ExecutionID != executionID || issued.AttemptKey.IncarnationID != roundTrip.IncarnationID ||
+				issued.AttemptKey.Sequence <= snapshot.Attempt || !issued.IssueCompleted {
+				t.Fatalf("restored Attempt identity = %+v (snapshot %+v)", issued, snapshot)
+			}
+			verified, err := restored.Verify(ctx, issued.AttemptKey, &fuzzIO{})
+			if err != nil {
+				if !errors.Is(err, ErrCounterExhausted) || verified.Committed {
+					t.Fatalf("restored Verification = %+v, %v", verified, err)
+				}
+			} else if !verified.Committed || restored.Snapshot().State != testRunning {
+				t.Fatalf("restored Verification did not commit: %+v", verified)
+			}
 		}
 	})
 }

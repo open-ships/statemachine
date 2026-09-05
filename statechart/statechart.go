@@ -46,6 +46,9 @@ var ErrNotPermitted = statemachine.ErrNotPermitted
 // ErrInFlight is [statemachine.ErrInFlight].
 var ErrInFlight = statemachine.ErrInFlight
 
+// ErrInvalidKey is [statemachine.ErrInvalidKey].
+var ErrInvalidKey = statemachine.ErrInvalidKey
+
 // Kind determines which states a transition exits and enters.
 type Kind uint8
 
@@ -159,20 +162,20 @@ type stateActions[S, E comparable, T any] struct {
 // concurrent use. A Chart does not itself own an active state; use [Chart.New]
 // to create an Instance.
 type Chart[S, E comparable, T any] struct {
-	states  map[S]stateActions[S, E, T]
-	order   []S
-	parent  map[S]S
-	initial map[S]S
-	rows    map[transitionKey[S, E]][]Transition[S, E, T]
-	events  map[S][]E
-	shape   *shape[S]
+	states         map[S]stateActions[S, E, T]
+	rows           map[transitionKey[S, E]][]Transition[S, E, T]
+	events         map[S][]E
+	shape          *shape[S]
+	reflexiveEvent bool
 }
 
 // Compile validates and copies definition. It rejects duplicate or undeclared
 // states, multiple parents, hierarchy cycles, multiple or non-child Initials,
 // invalid transition kinds or targets, and rows hidden by an earlier unguarded
 // row with the same From and Event. It reports all independently discoverable
-// defects together with [errors.Join].
+// defects together with [errors.Join]. State and event types must not contain
+// interfaces, and their values must equal themselves: NaN-bearing keys are
+// rejected with [ErrInvalidKey].
 func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Chart[S, E, T], error) {
 	if !keycheck.StrictType[S]() {
 		return nil, errors.New("statechart: state type must not contain an interface")
@@ -181,16 +184,21 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Chart[S, 
 		return nil, errors.New("statechart: event type must not contain an interface")
 	}
 	c := &Chart[S, E, T]{
-		states:  make(map[S]stateActions[S, E, T], len(definition.States)),
-		order:   make([]S, 0, len(definition.States)),
-		parent:  make(map[S]S, len(definition.Substates)),
-		initial: make(map[S]S, len(definition.Initials)),
-		rows:    make(map[transitionKey[S, E]][]Transition[S, E, T], len(definition.Transitions)),
-		events:  make(map[S][]E),
+		states:         make(map[S]stateActions[S, E, T], len(definition.States)),
+		rows:           make(map[transitionKey[S, E]][]Transition[S, E, T], len(definition.Transitions)),
+		events:         make(map[S][]E),
+		reflexiveEvent: keycheck.ReflexiveType[E](),
 	}
+	order := make([]S, 0, len(definition.States))
+	parents := make(map[S]S, len(definition.Substates))
+	initials := make(map[S]S, len(definition.Initials))
 	var problems []error
 	stateAt := make(map[S]int, len(definition.States))
 	for index, state := range definition.States {
+		if !keycheck.Value(state.Name) {
+			problems = append(problems, fmt.Errorf("statechart: states[%d].Name: %w", index, ErrInvalidKey))
+			continue
+		}
 		if previous, exists := stateAt[state.Name]; exists {
 			problems = append(problems, fmt.Errorf(
 				"statechart: states[%d] duplicates state %v declared at states[%d]",
@@ -198,7 +206,7 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Chart[S, 
 			continue
 		}
 		stateAt[state.Name] = index
-		c.order = append(c.order, state.Name)
+		order = append(order, state.Name)
 		c.states[state.Name] = stateActions[S, E, T]{
 			entry: append([]Action[S, E, T](nil), state.Entry...),
 			exit:  append([]Action[S, E, T](nil), state.Exit...),
@@ -222,10 +230,10 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Chart[S, 
 		}
 		parentAt[edge.Child] = index
 		if childKnown && parentKnown {
-			c.parent[edge.Child] = edge.Parent
+			parents[edge.Child] = edge.Parent
 		}
 	}
-	problems = append(problems, hierarchyCycles(c.order, c.parent)...)
+	problems = append(problems, hierarchyCycles(order, parents)...)
 
 	initialAt := make(map[S]int, len(definition.Initials))
 	for index, edge := range definition.Initials {
@@ -241,20 +249,24 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Chart[S, 
 		if !parentKnown || !childKnown {
 			continue
 		}
-		parent, direct := c.parent[edge.Child]
+		parent, direct := parents[edge.Child]
 		if !direct || parent != edge.Parent {
 			problems = append(problems, fmt.Errorf(
 				"statechart: initials[%d] child %v is not an immediate child of parent %v",
 				index, edge.Child, edge.Parent))
 			continue
 		}
-		c.initial[edge.Parent] = edge.Child
+		initials[edge.Parent] = edge.Child
 	}
 
 	unguarded := make(map[transitionKey[S, E]]int, len(definition.Transitions))
 	for index, transition := range definition.Transitions {
-		knownState(stateAt, transition.From, "transitions", index, "From", &problems)
-		knownState(stateAt, transition.To, "transitions", index, "To", &problems)
+		fromKnown := knownState(stateAt, transition.From, "transitions", index, "From", &problems)
+		toKnown := knownState(stateAt, transition.To, "transitions", index, "To", &problems)
+		if !keycheck.Value(transition.Event) {
+			problems = append(problems, fmt.Errorf("statechart: transitions[%d].Event: %w", index, ErrInvalidKey))
+			continue
+		}
 		switch transition.Kind {
 		case External:
 			if transition.From == transition.To {
@@ -271,6 +283,9 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Chart[S, 
 		default:
 			problems = append(problems, fmt.Errorf(
 				"statechart: transitions[%d] has invalid kind %v", index, transition.Kind))
+		}
+		if !fromKnown || !toKnown {
+			continue
 		}
 
 		key := transitionKey[S, E]{transition.From, transition.Event}
@@ -293,11 +308,15 @@ func Compile[S, E comparable, T any](definition Definition[S, E, T]) (*Chart[S, 
 	if len(problems) != 0 {
 		return nil, errors.Join(problems...)
 	}
-	c.shape = compileShape(c.order, c.parent)
+	c.shape = compileShape(order, parents, initials)
 	return c, nil
 }
 
 func knownState[S comparable](states map[S]int, value S, section string, index int, field string, problems *[]error) bool {
+	if !keycheck.Value(value) {
+		*problems = append(*problems, fmt.Errorf("statechart: %s[%d].%s: %w", section, index, field, ErrInvalidKey))
+		return false
+	}
 	if _, known := states[value]; known {
 		return true
 	}
@@ -313,38 +332,40 @@ func hierarchyCycles[S comparable](order []S, parent map[S]S) []error {
 		done
 	)
 	color := make(map[S]uint8, len(order))
-	stack := make([]S, 0, len(order))
-	positions := make(map[S]int, len(order))
+	positions := make(map[S]int)
 	var problems []error
-	var visit func(S)
-	visit = func(state S) {
-		switch color[state] {
-		case done:
-			return
-		case visiting:
-			start := positions[state]
-			cycle := append(append([]S(nil), stack[start:]...), state)
-			parts := make([]string, len(cycle))
-			for i, item := range cycle {
-				parts[i] = fmt.Sprint(item)
+	var path []S
+	for _, start := range order {
+		if color[start] != unseen {
+			continue
+		}
+		path = path[:0]
+		state := start
+		for {
+			if color[state] == done {
+				break
 			}
-			problems = append(problems, fmt.Errorf(
-				"statechart: hierarchy contains a cycle: %s", strings.Join(parts, " -> ")))
-			return
+			if color[state] == visiting {
+				cycle := append(append([]S(nil), path[positions[state]:]...), state)
+				parts := make([]string, len(cycle))
+				for index, item := range cycle {
+					parts[index] = fmt.Sprint(item)
+				}
+				problems = append(problems, fmt.Errorf("statechart: hierarchy contains a cycle: %s", strings.Join(parts, " -> ")))
+				break
+			}
+			color[state] = visiting
+			positions[state] = len(path)
+			path = append(path, state)
+			next, ok := parent[state]
+			if !ok {
+				break
+			}
+			state = next
 		}
-		color[state] = visiting
-		positions[state] = len(stack)
-		stack = append(stack, state)
-		if next, ok := parent[state]; ok {
-			visit(next)
-		}
-		stack = stack[:len(stack)-1]
-		delete(positions, state)
-		color[state] = done
-	}
-	for _, state := range order {
-		if color[state] == unseen {
-			visit(state)
+		for _, state := range path {
+			color[state] = done
+			delete(positions, state)
 		}
 	}
 	return problems
@@ -362,7 +383,7 @@ func MustCompile[S, E comparable, T any](definition Definition[S, E, T]) *Chart[
 
 // New creates an Instance restored at initial. If initial has an initial-state
 // chain, New resolves it without running entry actions. A composite state with
-// no Initial remains active itself.
+// no Initial remains active itself. Invalid initial values return [ErrInvalidKey].
 func (c *Chart[S, E, T]) New(initial S) (*Instance[S, E, T], error) {
 	return c.newInstance(initial, nil)
 }
@@ -384,7 +405,10 @@ func (c *Chart[S, E, T]) newInstance(
 	if c == nil {
 		return nil, errors.New("statechart: cannot create an instance from a nil chart")
 	}
-	if _, known := c.states[initial]; !known {
+	if !keycheck.Value(initial) {
+		return nil, ErrInvalidKey
+	}
+	if _, known := c.shape.stateIndex(initial); !known {
 		return nil, fmt.Errorf("statechart: initial state %v is undeclared", initial)
 	}
 	return &Instance[S, E, T]{
@@ -393,13 +417,8 @@ func (c *Chart[S, E, T]) newInstance(
 }
 
 func (c *Chart[S, E, T]) destination(state S) S {
-	for {
-		next, ok := c.initial[state]
-		if !ok {
-			return state
-		}
-		state = next
-	}
+	node := c.shape.nodes[c.shape.index[state]]
+	return c.shape.nodes[node.destination].state
 }
 
 type selected[S, E comparable, T any] struct {
@@ -408,11 +427,12 @@ type selected[S, E comparable, T any] struct {
 }
 
 func (c *Chart[S, E, T]) selectTransition(ctx context.Context, source S, event E, data T) (selected[S, E, T], []error, bool) {
-	if c == nil {
+	if c == nil || c.shape == nil {
 		return selected[S, E, T]{}, nil, false
 	}
 	var reasons []error
-	for state := source; ; {
+	for index := c.shape.index[source]; index != -1; index = c.shape.nodes[index].parent {
+		state := c.shape.nodes[index].state
 		for _, transition := range c.rows[transitionKey[S, E]{state, event}] {
 			destination := source
 			if transition.Kind != Internal {
@@ -430,88 +450,8 @@ func (c *Chart[S, E, T]) selectTransition(ctx context.Context, source S, event E
 			}
 			return selected[S, E, T]{transition: transition, info: info}, reasons, true
 		}
-		parent, ok := c.parent[state]
-		if !ok {
-			return selected[S, E, T]{}, reasons, false
-		}
-		state = parent
 	}
-}
-
-func (c *Chart[S, E, T]) ancestors(state S) []S {
-	path := []S{state}
-	for {
-		parent, ok := c.parent[state]
-		if !ok {
-			return path
-		}
-		path = append(path, parent)
-		state = parent
-	}
-}
-
-func (c *Chart[S, E, T]) leastCommonAncestor(source, target S) (S, bool) {
-	targets := make(map[S]struct{})
-	for _, state := range c.ancestors(target) {
-		targets[state] = struct{}{}
-	}
-	for _, state := range c.ancestors(source) {
-		if _, common := targets[state]; common {
-			return state, true
-		}
-	}
-	var zero S
-	return zero, false
-}
-
-func (c *Chart[S, E, T]) externalPaths(source, target, destination S) (exits, entries []S) {
-	lca, common := c.leastCommonAncestor(source, target)
-	for state := source; ; {
-		if common && state == lca {
-			break
-		}
-		exits = append(exits, state)
-		parent, ok := c.parent[state]
-		if !ok {
-			break
-		}
-		state = parent
-	}
-
-	up := c.ancestors(destination)
-	for _, state := range up {
-		if common && state == lca {
-			break
-		}
-		entries = append(entries, state)
-	}
-	reverse(entries)
-	return exits, entries
-}
-
-func (c *Chart[S, E, T]) reentryPaths(source, handler, destination S) (exits, entries []S) {
-	for state := source; ; {
-		exits = append(exits, state)
-		if state == handler {
-			break
-		}
-		state = c.parent[state]
-	}
-	for state := destination; ; {
-		entries = append(entries, state)
-		if state == handler {
-			break
-		}
-		state = c.parent[state]
-	}
-	reverse(entries)
-	return exits, entries
-}
-
-func reverse[S any](values []S) {
-	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
-		values[left], values[right] = values[right], values[left]
-	}
+	return selected[S, E, T]{}, reasons, false
 }
 
 // Phase identifies the lifecycle phase in which an Action failed.
@@ -551,7 +491,7 @@ type ActionError struct {
 	// ActionIndex is the zero-based index within State's entry or exit actions.
 	ActionIndex int
 	// Completed is the number of lifecycle actions in this phase that returned
-	// successfully before the failure.
+	// successfully before the failure. Ignored nil actions are not counted.
 	Completed int
 	Err       error
 }
@@ -576,8 +516,9 @@ func (e *ActionError) Unwrap() error {
 }
 
 // Instance owns the active state of one aggregate. The zero Instance is usable:
-// it starts in the zero state with an empty Chart and refuses every event. An
-// Instance must not be copied after first use.
+// it starts in the zero state with an empty Chart and refuses every valid event.
+// Invalid key values return [ErrInvalidKey]. An Instance must not be copied
+// after first use.
 type Instance[S, E comparable, T any] struct {
 	chart     Chart[S, E, T]
 	mu        sync.RWMutex
@@ -603,7 +544,8 @@ func (i *Instance[S, E, T]) State() S {
 // It selects rows in declaration order at the active state, then repeats at
 // each ancestor until a Guard applies. If none applies, Fire returns a refusal
 // that wraps [ErrNotPermitted] and every Guard reason, and leaves the state
-// unchanged.
+// unchanged. Invalid event values return [ErrInvalidKey] without running a
+// Guard or Action.
 //
 // For External and Reentry transitions, exit actions run child-to-parent, then
 // Do and entry actions run, then Destination is committed. Actions on one state
@@ -639,6 +581,9 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error
 		i.inFlight = false
 		i.mu.Unlock()
 	}()
+	if !i.chart.reflexiveEvent && !keycheck.Value(event) {
+		return source, ErrInvalidKey
+	}
 
 	selection, reasons, ok := i.chart.selectTransition(ctx, source, event, data)
 	if !ok {
@@ -655,15 +600,13 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error
 		return source, nil
 	}
 
-	var exits, entries []S
-	if transition.Kind == Reentry {
-		exits, entries = i.chart.reentryPaths(source, info.Handler, destination)
-	} else {
-		exits, entries = i.chart.externalPaths(source, transition.To, destination)
-	}
+	exits, entries := i.chart.shape.paths(source, transition.To, destination, transition.Kind == Reentry)
 	completedExits := 0
 	for _, state := range exits {
 		for index, action := range i.chart.states[state].exit {
+			if action == nil {
+				continue
+			}
 			if err := runAction(ctx, action, info, data); err != nil {
 				return source, &ActionError{
 					Phase: PhaseExit, State: state, ActionIndex: index,
@@ -680,6 +623,9 @@ func (i *Instance[S, E, T]) Fire(ctx context.Context, event E, data T) (S, error
 	completedEntries := 0
 	for _, state := range entries {
 		for index, action := range i.chart.states[state].entry {
+			if action == nil {
+				continue
+			}
 			if err := runAction(ctx, action, info, data); err != nil {
 				return source, &ActionError{
 					Phase: PhaseEntry, State: state, ActionIndex: index,
@@ -743,7 +689,8 @@ func (i *Instance[S, E, T]) Permitted(ctx context.Context, data T) iter.Seq2[E, 
 
 	seen := make(map[E]struct{})
 	var permits []permit[S, E]
-	for state := source; ; {
+	for index := chart.shape.index[source]; index != -1; index = chart.shape.nodes[index].parent {
+		state := chart.shape.nodes[index].state
 		for _, event := range chart.events[state] {
 			if _, duplicate := seen[event]; duplicate {
 				continue
@@ -755,11 +702,6 @@ func (i *Instance[S, E, T]) Permitted(ctx context.Context, data T) iter.Seq2[E, 
 			}
 			permits = append(permits, permit[S, E]{event, selection.info.Destination})
 		}
-		parent, ok := chart.parent[state]
-		if !ok {
-			break
-		}
-		state = parent
 	}
 	return func(yield func(E, S) bool) {
 		for _, permit := range permits {

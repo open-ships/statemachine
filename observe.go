@@ -2,7 +2,6 @@ package statemachine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -10,45 +9,17 @@ import (
 )
 
 // ErrObserverFailed reports a contained Observer panic or runtime.Goexit.
-var ErrObserverFailed = errors.New("statemachine: observer failed after commit")
+var ErrObserverFailed = internalobserver.ErrFailed
 
 // ErrObserverTimeout reports that a delivery wrapped by [TimeoutObserver]
 // exceeded its bound. The observer goroutine may still be running.
-var ErrObserverTimeout = errors.New("statemachine: observer delivery timed out")
+var ErrObserverTimeout = internalobserver.ErrTimeout
 
 // ObserverError preserves one contained Observer failure and its original
 // stack. The observed state change remains committed.
-type ObserverError struct {
-	Observer int
-	Seq      uint64
-	Value    any
-	Stack    string
-	Stopped  bool
-}
-
-func (e *ObserverError) Error() string {
-	if e == nil {
-		return "<nil>"
-	}
-	if e.Stopped {
-		return fmt.Sprintf("%v: observer %d stopped at observation %d", ErrObserverFailed, e.Observer, e.Seq)
-	}
-	return fmt.Sprintf("%v: observer %d panicked at observation %d: %v", ErrObserverFailed, e.Observer, e.Seq, e.Value)
-}
-
-// Unwrap makes every ObserverError match ErrObserverFailed and, when the
-// contained panic value is itself an error — as it is for [TimeoutObserver]
-// timeouts and nested ObserverErrors — that error too, so errors.Is can reach
-// [ErrObserverTimeout] through the containment layers.
-func (e *ObserverError) Unwrap() []error {
-	if e == nil {
-		return nil
-	}
-	if cause, ok := e.Value.(error); ok {
-		return []error{ErrObserverFailed, cause}
-	}
-	return []error{ErrObserverFailed}
-}
+// It matches ErrObserverFailed and, when Value is an error, preserves that
+// error in its unwrap chain, including ErrObserverTimeout and nested failures.
+type ObserverError = internalobserver.Error
 
 // Move identifies one committed change in node membership.
 type Move uint8
@@ -109,9 +80,10 @@ type Observation[S, E comparable] struct {
 // but isolated: Fire waits for Observer to return, while a panic or
 // runtime.Goexit in Observer is contained, retains its stack, and is returned
 // as an error matching ErrObserverFailed after commit. Later deliveries are
-// still attempted. One
-// Observer attached to several executions may be called concurrently and must
-// synchronize any shared mutable state.
+// still attempted. An Observer attached to several executions may be called
+// concurrently. TimeoutObserver can also overlap successive deliveries within
+// one execution when an earlier callback outlives its timeout. Such observers
+// must synchronize shared mutable state.
 type Observer[S, E comparable, T any] func(context.Context, Observation[S, E], T)
 
 // Observers combines observers in argument order. Nil observers are ignored.
@@ -124,21 +96,7 @@ type Observer[S, E comparable, T any] func(context.Context, Observation[S, E], T
 // Observer directly, outside an Instance or Runtime, must be prepared to
 // recover that panic itself.
 func Observers[S, E comparable, T any](observers ...Observer[S, E, T]) Observer[S, E, T] {
-	observers = copyObservers(observers)
-	if len(observers) == 0 {
-		return nil
-	}
-	return func(ctx context.Context, observation Observation[S, E], data T) {
-		var failures []error
-		for index, observer := range observers {
-			if err := callObserver(index, observer, ctx, observation, data); err != nil {
-				failures = append(failures, err)
-			}
-		}
-		if len(failures) != 0 {
-			panic(errors.Join(failures...))
-		}
-	}
+	return internalobserver.Combine(observers, observationSequence[S, E])
 }
 
 // TimeoutObserver bounds one observer's synchronous delivery. The wrapped
@@ -147,11 +105,15 @@ func Observers[S, E comparable, T any](observers ...Observer[S, E, T]) Observer[
 // [ErrObserverFailed] while the committed state change stands. Panics and
 // runtime.Goexit inside the wrapped observer keep their original stacks.
 //
-// A timed-out observer goroutine is abandoned, not terminated: it may still be
-// running, and an observer that blocks permanently leaks one goroutine per
-// timed-out delivery. The bound therefore protects the execution's liveness,
-// not the process's total resources; an observer that can block — a network
-// logger, a slow sink — should also carry its own internal deadline.
+// The callback receives a context derived from the request with the timeout
+// deadline; its values and earlier cancellation are preserved. The context is
+// canceled when delivery finishes, so cooperative callbacks can stop promptly.
+// Request cancellation does not skip delivery or by itself cause a timeout.
+//
+// A timed-out goroutine can keep running and overlap later deliveries, even
+// within the same execution. Shared mutable state must therefore be protected.
+// A callback that ignores cancellation and blocks permanently leaks one
+// goroutine per timed-out delivery; the timeout only bounds the caller's wait.
 //
 // timeout must be positive; TimeoutObserver panics otherwise, because an
 // unbounded bound is a construction defect, not a runtime condition. A nil
@@ -160,82 +122,35 @@ func TimeoutObserver[S, E comparable, T any](
 	observer Observer[S, E, T],
 	timeout time.Duration,
 ) Observer[S, E, T] {
-	if timeout <= 0 {
-		panic("statemachine: TimeoutObserver requires a positive timeout")
-	}
-	if observer == nil {
-		return nil
-	}
-	return func(ctx context.Context, observation Observation[S, E], data T) {
-		done := internalobserver.Start(func() { observer(ctx, observation, data) })
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		select {
-		case failure := <-done:
-			if failure != nil {
-				panic(&ObserverError{
-					Seq: observation.Seq, Value: failure.Value,
-					Stack: failure.Stack, Stopped: failure.Stopped,
-				})
-			}
-		case <-timer.C:
-			panic(fmt.Errorf("%w after %v", ErrObserverTimeout, timeout))
-		}
-	}
+	return internalobserver.Timeout(observer, timeout, observationSequence[S, E])
 }
 
 // ContainedObserver separates observation health from the transition error
 // channel. Failures of the wrapped observer — panic, runtime.Goexit, or a
 // [TimeoutObserver] timeout — never join the error returned by Fire: they are
-// passed to report as an error matching [ErrObserverFailed], on the delivering
-// goroutine, and the delivery is treated as successful.
+// passed to report as an error matching [ErrObserverFailed], and the delivery
+// is treated as successful.
 //
-// This is the seam for callers that must preserve the invariant that a non-nil
-// Fire error implies the transition did not commit. A nil report drops
-// failures. A panic or runtime.Goexit in report itself is contained and
-// dropped: the reporting seam must never become a new failure channel. A nil
-// observer returns nil, which deliveries ignore.
+// Use this to keep observation failures separate from execution errors. It
+// changes only observation errors: a queued Run can still commit earlier
+// events before a later event fails. A nil report drops failures.
+// Reporting is synchronous in an isolated goroutine: a panic or
+// runtime.Goexit in report is contained and dropped, but a blocked report holds
+// delivery indefinitely. Wrap the returned Observer in TimeoutObserver to bound
+// reporting as well. A nil observer returns nil, which deliveries ignore.
 func ContainedObserver[S, E comparable, T any](
 	observer Observer[S, E, T],
 	report func(error),
 ) Observer[S, E, T] {
-	if observer == nil {
-		return nil
-	}
-	return func(ctx context.Context, observation Observation[S, E], data T) {
-		err := callObserver(0, observer, ctx, observation, data)
-		if err == nil || report == nil {
-			return
-		}
-		_ = internalobserver.Call(func() { report(err) })
-	}
+	return internalobserver.Contained(observer, report, observationSequence[S, E])
 }
 
 func copyObservers[S, E comparable, T any](observers []Observer[S, E, T]) []Observer[S, E, T] {
-	result := make([]Observer[S, E, T], 0, len(observers))
-	for _, observer := range observers {
-		if observer != nil {
-			result = append(result, observer)
-		}
-	}
-	return result
+	return internalobserver.Copy(observers)
 }
 
-func callObserver[S, E comparable, T any](
-	index int,
-	observer Observer[S, E, T],
-	ctx context.Context,
-	observation Observation[S, E],
-	data T,
-) error {
-	failure := internalobserver.Call(func() { observer(ctx, observation, data) })
-	if failure == nil {
-		return nil
-	}
-	return &ObserverError{
-		Observer: index, Seq: observation.Seq, Value: failure.Value,
-		Stack: failure.Stack, Stopped: failure.Stopped,
-	}
+func observationSequence[S, E comparable](observation Observation[S, E]) uint64 {
+	return observation.Seq
 }
 
 func deliverObservations[S, E comparable, T any](
@@ -244,18 +159,9 @@ func deliverObservations[S, E comparable, T any](
 	observations []Observation[S, E],
 	data T,
 ) error {
-	if len(observers) == 0 || len(observations) == 0 {
-		return nil
-	}
-	var failures []error
-	for _, observation := range observations {
-		for index, observer := range observers {
-			if err := callObserver(index, observer, ctx, observation, data); err != nil {
-				failures = append(failures, err)
-			}
-		}
-	}
-	return errors.Join(failures...)
+	return internalobserver.Deliver(observers, ctx, len(observations), func(index int) (Observation[S, E], uint64) {
+		return observations[index], observations[index].Seq
+	}, data)
 }
 
 func deliverTransitionObservations[S, E comparable, T any](
