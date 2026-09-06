@@ -13,7 +13,10 @@ pinned govulncheck, and the separate SQLite integration module's race tests.
 The library's root module must remain free of third-party dependencies;
 `integration/sqlite` owns its test-only database dependencies. `coverage.out`
 is the retained coverage profile. The tools run at explicit versions without
-adding them to the library's dependency graph.
+adding them to the library's dependency graph. In CI, the versioned
+`open-ships/ci` workflow supplies these binaries and sets `OPEN_SHIPS_CI=true`;
+the script then uses the supplied toolset. Local runs retain explicit tool
+versions as a self-contained fallback.
 
 Use `./scripts/check.sh test` for a shorter vet-and-test pass. CI uses Go 1.26.8
 on Linux, macOS, and Windows, runs the full source checks on Linux, and tests the
@@ -35,7 +38,8 @@ alongside the fix. The local Go build cache can also retain nonfailing discoveri
 that cache is an optimization, not durable regression evidence.
 
 Benchmarks run three 100 ms samples per benchmark with allocation reporting.
-CI retains the raw `benchmark.out`, including toolchain and platform, for
+CI retains `coverage.out` and the raw `benchmark.out` together in the
+`source-assurance-<sha>` artifact, including toolchain and platform, for
 comparison with a previous run using `benchstat`. Compare the same toolchain,
 hardware, and benchmark units; hosted-runner timing alone is not a regression
 gate. No performance budget is inferred from a single smoke measurement.

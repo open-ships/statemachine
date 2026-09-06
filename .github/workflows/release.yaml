@@ -24,11 +24,10 @@ jobs:
         github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_repository.full_name == github.repository
       }}
-    uses: open-ships/ci/.github/workflows/release-go.yaml@e1753d11eefffbc9e4bc05e26927c3893d9605b4 # v1.1.0
+    uses: open-ships/ci/.github/workflows/release-go.yaml@95d4b3ed5452a99525c240688de146553e57cee0 # shared CI v1.2.0 candidate
     with:
       commit-sha: ${{ github.event.workflow_run.head_sha }}
       project-name: statemachine
       distribution: source
-      go-version: 1.26.8
       coverage-floor: 90
       publish-coverage: true

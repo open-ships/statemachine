@@ -31,9 +31,21 @@ if [ "$module_graph" != "$root_module" ] || [ -f go.sum ]; then
   exit 1
 fi
 
-go run github.com/kisielk/errcheck@v1.20.0 ./...
-go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
-go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+# CI supplies tools from the versioned open-ships/ci workflow. Local checks
+# remain self-contained; do not download an independent toolset inside CI.
+run_tool() {
+  local tool="$1" module="$2"
+  shift 2
+  if [ "${OPEN_SHIPS_CI:-}" = true ]; then
+    "$tool" "$@"
+  else
+    go run "$module" "$@"
+  fi
+}
+
+run_tool errcheck github.com/kisielk/errcheck@v1.20.0 ./...
+run_tool staticcheck honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+run_tool actionlint github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
 coverage_output="${COVERAGE_OUTPUT:-coverage.out}"
 coverage_floor="${COVERAGE_FLOOR:-90}"
@@ -47,5 +59,5 @@ if ! awk -v coverage="$coverage_percent" -v floor="$coverage_floor" 'BEGIN {
 fi
 printf 'Statement coverage: %s%% (minimum %s%%)\n' "$coverage_percent" "$coverage_floor"
 
-go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+run_tool govulncheck golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 go -C integration/sqlite test -race ./...

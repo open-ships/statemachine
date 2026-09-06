@@ -8,100 +8,52 @@ on:
 permissions:
   contents: read
 
-env:
-  GOTOOLCHAIN: local
-
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up supported Go patch release
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.26.8"
-          cache-dependency-path: |
-            go.mod
-            integration/sqlite/go.sum
-
-      - name: Platform tests
-        if: runner.os != 'Linux'
-        shell: bash
-        run: ./scripts/check.sh test
-
-      - name: Source assurance and SQLite integration
-        if: runner.os == 'Linux'
-        shell: bash
-        run: ./scripts/check.sh
-
-      - name: Retain coverage evidence
-        if: always() && runner.os == 'Linux'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage-${{ github.sha }}
-          path: coverage.out
-          if-no-files-found: ignore
-
-      - name: Repeated benchmarks
-        if: runner.os == 'Linux'
-        run: ./scripts/benchmark.sh
-
-      - name: Retain benchmark evidence
-        if: always() && runner.os == 'Linux'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: benchmarks-${{ github.sha }}
-          path: benchmark.out
-          if-no-files-found: ignore
+    uses: open-ships/ci/.github/workflows/check-go.yaml@95d4b3ed5452a99525c240688de146553e57cee0 # shared CI v1.2.0 candidate
+    with:
+      runner: ${{ matrix.os }}
+      static-analysis: ${{ matrix.os == 'ubuntu-latest' }}
+      artifact-name: source-assurance-${{ github.sha }}
+      artifact-path: |
+        coverage.out
+        benchmark.out
+      command: |
+        if [ "$RUNNER_OS" = Linux ]; then
+          ./scripts/check.sh
+          ./scripts/benchmark.sh
+        else
+          ./scripts/check.sh test
+        fi
+      artifact-enabled: ${{ matrix.os == 'ubuntu-latest' }}
 
   toolchain-compatibility:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - go: "1.26.0"
+          - go: 1.26.0
             purpose: minimum
-          - go: "1.27.1"
+          - go: 1.27.1
             purpose: current
     name: Go ${{ matrix.go }} (${{ matrix.purpose }})
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Set up compatibility toolchain
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ matrix.go }}
-          cache-dependency-path: go.mod
-      - name: Root-module language and toolchain compatibility
-        run: ./scripts/check.sh test
+    uses: open-ships/ci/.github/workflows/check-go.yaml@95d4b3ed5452a99525c240688de146553e57cee0 # shared CI v1.2.0 candidate
+    with:
+      go-version: ${{ matrix.go }}
+      cache-dependency-path: go.mod
+      command: |
+        ./scripts/check.sh test
 
-  # Per-change live coverage supplements ordinary seed execution. The sustained
-  # campaign in fuzz.yml has the same discovery and failure-retention policy.
+  # Per-change live fuzzing supplements seed execution and the nightly campaign.
   fuzz-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.26.8"
-          cache-dependency-path: go.mod
-      - name: Fuzz every target briefly
-        env:
-          FUZZTIME: 20s
-        run: ./scripts/fuzz.sh
-      - name: Retain failing inputs
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: fuzz-smoke-failures-${{ github.sha }}
-          path: '**/testdata/fuzz/**'
-          if-no-files-found: ignore
+    uses: open-ships/ci/.github/workflows/check-go.yaml@95d4b3ed5452a99525c240688de146553e57cee0 # shared CI v1.2.0 candidate
+    with:
+      environment: '{"FUZZTIME":"20s"}'
+      failure-artifact-name: fuzz-smoke-failures-${{ github.sha }}
+      failure-artifact-path: '**/testdata/fuzz/**'
+      command: |
+        ./scripts/fuzz.sh
