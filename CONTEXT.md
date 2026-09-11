@@ -113,7 +113,8 @@ _Avoid_: Store, Recorder
 - A configured **Journal** durably records an in-doubt Snapshot before Issue. Controller fencing and atomic plant commands remain external responsibilities.
 - Lifecycle Record identity is **Execution ID**, **Incarnation ID**, and Seq. Seq orders decisions within an incarnation; Restarts is a saved restoration count, not a uniqueness authority.
 - Recover does not reset Supervisor lifecycle history; ordinary bounded retention still applies. History retains the highest Seq values, regardless of publication order. A Recorder failure or busy delivery is exposed through Status.
-- Within one Supervisor, each Journal or Recorder admits at most one outstanding delivery and retains ownership until it ends. A shared adapter can still be called concurrently by different Supervisors. Trip and verification-expiry publication also prevent recovery until their delivery pipeline finishes.
+- Within one Supervisor, each Journal or Recorder admits at most one outstanding delivery and retains ownership until it ends. A shared adapter can still be called concurrently by different Supervisors. Trip and verification-expiry publication also prevent recovery until their delivery pipeline finishes. Expiry has the same ownership and original Change evidence whether Verify or a timer detects it; a timer never releases an enclosing Issue call.
+- A Runtime retains committed Steps' observer failures even when a later callback terminates the Run with runtime.Goexit.
 - For a selected Attempt and its Verify or Adopt outcome, **Change** retains the original Attempt revision and start time. A Result or Record separately reports the resulting revision, adjudication outcome, and operation timing.
 
 ## Example dialogue

@@ -1,0 +1,160 @@
+
+Fuzzing github.com/open-ships/statemachine FuzzInstanceFire (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/19 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 19/19 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 490969 (163642/sec), new interesting: 0 (total: 19)
+fuzz: elapsed: 3s, execs: 490969 (0/sec), new interesting: 0 (total: 19)
+PASS
+ok  	github.com/open-ships/statemachine	5.587s
+
+Fuzzing github.com/open-ships/statemachine FuzzZeroAndCompiledKeyChecks (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/5 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 5/5 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 453540 (151177/sec), new interesting: 0 (total: 5)
+fuzz: elapsed: 3s, execs: 453540 (0/sec), new interesting: 0 (total: 5)
+PASS
+ok  	github.com/open-ships/statemachine	3.466s
+
+Fuzzing github.com/open-ships/statemachine FuzzFloatingMachineKeys (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/5 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 5/5 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 460658 (153547/sec), new interesting: 1 (total: 6)
+fuzz: elapsed: 3s, execs: 460658 (0/sec), new interesting: 1 (total: 6)
+PASS
+ok  	github.com/open-ships/statemachine	3.335s
+
+Fuzzing github.com/open-ships/statemachine/internal/keycheck FuzzValueFloatingKeys (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/2 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 2/2 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 1083586 (361147/sec), new interesting: 0 (total: 2)
+fuzz: elapsed: 3s, execs: 1083586 (0/sec), new interesting: 0 (total: 2)
+PASS
+ok  	github.com/open-ships/statemachine/internal/keycheck	3.437s
+
+Fuzzing github.com/open-ships/statemachine/persist FuzzStoreContract (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/5 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 5/5 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 1009873 (336593/sec), new interesting: 0 (total: 5)
+fuzz: elapsed: 3s, execs: 1009873 (0/sec), new interesting: 0 (total: 5)
+PASS
+ok  	github.com/open-ships/statemachine/persist	3.357s
+
+Fuzzing github.com/open-ships/statemachine/persist FuzzMemoryStoreSerialization (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/14 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 14/14 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 535772 (178569/sec), new interesting: 4 (total: 18)
+fuzz: elapsed: 3s, execs: 535772 (0/sec), new interesting: 4 (total: 18)
+PASS
+ok  	github.com/open-ships/statemachine/persist	3.308s
+
+Fuzzing github.com/open-ships/statemachine/persist FuzzStoreSuccessConsistency (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/3 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 3/3 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 984752 (328223/sec), new interesting: 0 (total: 3)
+fuzz: elapsed: 3s, execs: 984752 (0/sec), new interesting: 0 (total: 3)
+PASS
+ok  	github.com/open-ships/statemachine/persist	3.301s
+
+Fuzzing github.com/open-ships/statemachine/queued FuzzQueuedRuntimeModel (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/11 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 11/11 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 585601 (195178/sec), new interesting: 0 (total: 11)
+fuzz: elapsed: 3s, execs: 585601 (0/sec), new interesting: 0 (total: 11)
+PASS
+ok  	github.com/open-ships/statemachine/queued	3.415s
+
+Fuzzing github.com/open-ships/statemachine/queued FuzzQueuedRuntimeLimits (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/7 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 7/7 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 346960 (115652/sec), new interesting: 1 (total: 8)
+fuzz: elapsed: 3s, execs: 346960 (0/sec), new interesting: 1 (total: 8)
+PASS
+ok  	github.com/open-ships/statemachine/queued	3.350s
+
+Fuzzing github.com/open-ships/statemachine/queued FuzzQueuedCancellation (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/2 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 2/2 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 619175 (206374/sec), new interesting: 0 (total: 2)
+fuzz: elapsed: 3s, execs: 619175 (0/sec), new interesting: 0 (total: 2)
+PASS
+ok  	github.com/open-ships/statemachine/queued	3.398s
+
+Fuzzing github.com/open-ships/statemachine/statechart FuzzStatechartCompile (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/54 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 54/54 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 432825 (144230/sec), new interesting: 0 (total: 54)
+fuzz: elapsed: 3s, execs: 432825 (0/sec), new interesting: 0 (total: 54)
+PASS
+ok  	github.com/open-ships/statemachine/statechart	3.343s
+
+Fuzzing github.com/open-ships/statemachine/statechart FuzzStatechartFire (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/32 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 32/32 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 463007 (154323/sec), new interesting: 0 (total: 32)
+fuzz: elapsed: 3s, execs: 463007 (0/sec), new interesting: 0 (total: 32)
+PASS
+ok  	github.com/open-ships/statemachine/statechart	3.320s
+
+Fuzzing github.com/open-ships/statemachine/statechart FuzzStatechartFailureCommit (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/22 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 22/22 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 525494 (175105/sec), new interesting: 0 (total: 22)
+fuzz: elapsed: 3s, execs: 525494 (0/sec), new interesting: 0 (total: 22)
+PASS
+ok  	github.com/open-ships/statemachine/statechart	3.372s
+
+Fuzzing github.com/open-ships/statemachine/supervised FuzzSupervisorModel (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/289 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 289/289 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 178194 (59396/sec), new interesting: 9 (total: 298)
+fuzz: elapsed: 4s, execs: 178194 (0/sec), new interesting: 9 (total: 298)
+PASS
+ok  	github.com/open-ships/statemachine/supervised	3.863s
+
+Fuzzing github.com/open-ships/statemachine/supervised FuzzSupervisorRestartModel (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/228 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 228/228 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 179933 (59975/sec), new interesting: 3 (total: 231)
+fuzz: elapsed: 3s, execs: 179933 (0/sec), new interesting: 3 (total: 231)
+PASS
+ok  	github.com/open-ships/statemachine/supervised	3.497s
+
+Fuzzing github.com/open-ships/statemachine/supervised FuzzAdversarialClock (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/107 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 107/107 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 247727 (82575/sec), new interesting: 2 (total: 109)
+fuzz: elapsed: 3s, execs: 247727 (0/sec), new interesting: 2 (total: 109)
+PASS
+ok  	github.com/open-ships/statemachine/supervised	3.369s
+
+Fuzzing github.com/open-ships/statemachine/supervised FuzzConcurrentSupervisor (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/165 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 165/165 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 173849 (57948/sec), new interesting: 18 (total: 183)
+fuzz: elapsed: 3s, execs: 173849 (0/sec), new interesting: 18 (total: 183)
+PASS
+ok  	github.com/open-ships/statemachine/supervised	3.616s
+
+Fuzzing github.com/open-ships/statemachine/supervised FuzzSnapshotRestore (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/41 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 41/41 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 288514 (96164/sec), new interesting: 4 (total: 45)
+fuzz: elapsed: 3s, execs: 288514 (0/sec), new interesting: 4 (total: 45)
+PASS
+ok  	github.com/open-ships/statemachine/supervised	3.338s
+
+Fuzzing github.com/open-ships/statemachine/supervised FuzzDefinitionCompile (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/113 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 113/113 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 392002 (130657/sec), new interesting: 6 (total: 119)
+fuzz: elapsed: 3s, execs: 392002 (0/sec), new interesting: 6 (total: 119)
+PASS
+ok  	github.com/open-ships/statemachine/supervised	3.360s
+
+Fuzzing github.com/open-ships/statemachine/supervised FuzzRecorderJournalFaultInjection (3s)
+fuzz: elapsed: 0s, gathering baseline coverage: 0/54 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 54/54 completed, now fuzzing with 10 workers
+fuzz: elapsed: 3s, execs: 70342 (23447/sec), new interesting: 3 (total: 57)
+fuzz: elapsed: 3s, execs: 70342 (0/sec), new interesting: 3 (total: 57)
+PASS
+ok  	github.com/open-ships/statemachine/supervised	3.303s

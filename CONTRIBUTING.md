@@ -9,7 +9,8 @@ GOTOOLCHAIN=go1.26.8 ./scripts/check.sh
 
 The script runs vet, pinned errcheck and staticcheck, workflow lint, formatting,
 a root module-graph check, race tests with a 90% statement-coverage floor,
-pinned govulncheck, and the separate SQLite integration module's race tests.
+pinned govulncheck for the root and separate SQLite modules, and SQLite race
+tests. The SQLite scan includes tests because its driver is a test dependency.
 The library's root module must remain free of third-party dependencies;
 `integration/sqlite` owns its test-only database dependencies. `coverage.out`
 is the retained coverage profile. The tools run at explicit versions without

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Keep verification-expiry publication owned through Journal and Recorder
+  delivery whether Verify or a timer detects the deadline. Recovery and
+  adjudication cannot overtake publication, and timer expiry cannot release
+  an enclosing Issue call that has not returned.
+- Preserve the original Change and known Issue completion in synchronous
+  verification-timeout results and records. Expiration timing is recorded
+  separately from the original command's start time.
+- Retain earlier committed Steps' observer failures, original causes, and
+  stacks when a later queued callback exits with runtime.Goexit.
+- Strengthen the queued fuzz model with exact event traces and effect counts,
+  independent cursors, and explicit synchronous cancellation outcomes.
+- Scan the separate SQLite integration module, including test dependencies,
+  for known vulnerabilities in the full local and CI checks.
+
 ## 1.4.0 — first stable release
 
 This version establishes the stable interface. Every earlier tag is a development

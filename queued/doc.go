@@ -39,7 +39,9 @@
 // Step; a self-transition root can therefore be silent while a changing
 // follow-up establishes that identifier. Observer delivery is synchronous;
 // panic and runtime.Goexit failures retain their stacks and return as
-// post-commit errors matching statemachine.ErrObserverFailed. Its context
+// post-commit errors matching statemachine.ErrObserverFailed. If a later
+// callback calls runtime.Goexit, Fire joins ErrExecutionStopped with all
+// observation failures from earlier committed Steps. Its context
 // preserves cancellation and values, rejects Runtime.Fire as reentrant, and
 // deliberately refuses Enqueue so observation cannot extend the Run.
 package queued

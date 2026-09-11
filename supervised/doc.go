@@ -35,6 +35,9 @@
 // CallbackRunning, and Recover is rejected until the prior Operation call and
 // every callback it started have stopped. Verification admission checks its
 // stored monotonic deadline synchronously; the timer is notification only.
+// Both expiry paths retain the original Change and known Issue completion,
+// expose ReportingRunning through publication, and exclude recovery until
+// publication and any detached sink callbacks finish.
 //
 // NewWithOptions supplies deterministic Clock, durable Journal, and Recorder
 // seams. A Machine that declares external Issue actions requires a Journal by

@@ -1,0 +1,60 @@
+package supervised
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+func reviewExpiredSupervisor(t *testing.T) (*Supervisor[testState, testEvent, *testData], Result[testState, testEvent]) {
+	t.Helper()
+	clock := newFakeClock()
+	s, err := NewWithOptions(MustCompile(validDefinition()), Options[testState, testEvent]{
+		Limits:  Limits{OperationTimeout: time.Minute, VerificationTimeout: time.Second},
+		Clock:   clock,
+		Journal: func(context.Context, Snapshot[testState, testEvent]) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Start(context.Background(), &testData{}); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := s.Issue(context.Background(), testStart, &testData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.advance(time.Second) // Clock contract explicitly permits delayed timer dispatch.
+	return s, issued
+}
+
+func TestReviewExpiredVerifyOwnsPublication(t *testing.T) {
+	s, issued := reviewExpiredSupervisor(t)
+	// Model scheduler preemption at Verify's existing decision/finalize seam.
+	// No production state is changed by the test, and the real Clock contract holds.
+	decision := s.verifyDecision(context.Background(), issued.AttemptKey, &testData{})
+	if !errors.Is(decision.Err, ErrVerificationTimeout) {
+		t.Fatal(decision.Err)
+	}
+	defer s.finalize(RecordVerify, decision)
+	status := s.Status()
+	t.Logf("unpublished expiry: operation=%v reporting=%v", status.OperationRunning, status.ReportingRunning)
+	recovered, err := s.Recover(context.Background(), &testData{})
+	if !errors.Is(err, ErrCallbackRunning) {
+		t.Fatalf("Recover ran before expired Verify publication: err=%v, phase=%v, mode=%v", err, recovered.Phase, s.Status().Mode)
+	}
+}
+
+func TestReviewExpiredVerifyPreservesChange(t *testing.T) {
+	s, issued := reviewExpiredSupervisor(t)
+	result, err := s.Verify(context.Background(), issued.AttemptKey, &testData{})
+	if !errors.Is(err, ErrVerificationTimeout) {
+		t.Fatal(err)
+	}
+	records := s.Records()
+	record := records[len(records)-1]
+	if result.Change != issued.Change || record.Change != issued.Change || !result.IssueCompleted || !record.Issued {
+		t.Fatalf("expired Verify lost command evidence: result.Change=%+v, record.Change=%+v, IssueCompleted=%v, Issued=%v; want original %+v", result.Change, record.Change, result.IssueCompleted, record.Issued, issued.Change)
+	}
+}

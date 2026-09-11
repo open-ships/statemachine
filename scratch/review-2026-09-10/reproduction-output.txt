@@ -1,0 +1,15 @@
+=== RUN   TestReviewExpiredVerifyOwnsPublication
+    review_20260910_test.go:42: unpublished expiry: operation=false reporting=false
+    review_20260910_test.go:45: Recover ran before expired Verify publication: err=<nil>, phase=recover, mode=ready
+--- FAIL: TestReviewExpiredVerifyOwnsPublication (0.00s)
+=== RUN   TestReviewExpiredVerifyPreservesChange
+    review_20260910_test.go:58: expired Verify lost command evidence: result.Change={Attempt:{DefinitionID: ExecutionID: IncarnationID: ID:0 Revision:0 StartedAt:0001-01-01 00:00:00 +0000 UTC From: Event:} TransitionID: To:}, record.Change={Attempt:{DefinitionID: ExecutionID: IncarnationID: ID:0 Revision:0 StartedAt:0001-01-01 00:00:00 +0000 UTC From: Event:} TransitionID: To:}, IssueCompleted=false, Issued=false; want original {Attempt:{DefinitionID:test-machine/v1 ExecutionID:db4c9000b8a4c9e07ae6df24cc56be0e IncarnationID:db4c9000b8a4c9e07ae6df24cc56be0e ID:1 Revision:0 StartedAt:2026-08-08 12:00:00 +0000 UTC From:idle Event:start} TransitionID:start-running To:running}
+--- FAIL: TestReviewExpiredVerifyPreservesChange (0.00s)
+FAIL
+FAIL	github.com/open-ships/statemachine/supervised	0.427s
+=== RUN   TestReviewObserverFailureSurvivesLaterGoexit
+    review_20260910_test.go:33: earlier committed step lost observer failure: state=1 error=queued: callback stopped its execution goroutine
+--- FAIL: TestReviewObserverFailureSurvivesLaterGoexit (0.00s)
+FAIL
+FAIL	github.com/open-ships/statemachine/queued	0.245s
+FAIL

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -32,15 +33,17 @@ type qProgram struct {
 	instructions []qInstruction
 	cursor       int
 	executed     int
+	trace        []qEvent
 	violations   []string
 	cancelRoot   context.CancelFunc
 	runtime      *queued.Runtime[qState, qEvent, *qProgram]
 }
 
-func (p *qProgram) next() qInstruction {
+func (p *qProgram) next(event qEvent) qInstruction {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.executed++
+	p.trace = append(p.trace, event)
 	if p.cursor >= len(p.instructions) {
 		return qInstruction{}
 	}
@@ -61,7 +64,7 @@ func qTable() *statemachine.Machine[qState, qEvent, *qProgram] {
 			table = append(table, statemachine.Transition[qState, qEvent, *qProgram]{
 				From: from, Event: ev, To: qNext(from, ev),
 				Do: func(ctx context.Context, program *qProgram) error {
-					instruction := program.next()
+					instruction := program.next(ev)
 					if instruction.reentrant {
 						if _, err := program.runtime.Fire(ctx, ev, program); !errors.Is(err, queued.ErrReentrant) {
 							program.mu.Lock()
@@ -118,9 +121,13 @@ func decodeInstructions(data []byte) []qInstruction {
 // checks the committed state after every root against an independent
 // simulation of FIFO cascade semantics: follow-ups run after the root event,
 // the cascade aborts on the first error or observed cancellation, and
-// discarded follow-ups never run.
+// discarded follow-ups never run. Exact event traces, callback counts, and
+// instruction cursors are checked without copying runtime progress into the
+// model. Cancellation is synchronous inside an effect, so that effect commits
+// on success and a queued successor observes cancellation before its callback.
 func FuzzQueuedRuntimeModel(f *testing.F) {
 	f.Add([]byte{0, 0}, []byte{0})
+	f.Add([]byte{0, 3, 0, 0, 0, 0, 0, 0}, []byte{0})
 	f.Add([]byte{0, 3, 0, 0, 0, 0}, []byte{0, 1})
 	f.Add([]byte{1, 0, 0, 2}, []byte{2, 0})
 	f.Add([]byte{4, 1, 2, 2, 0, 0}, []byte{1})
@@ -136,6 +143,8 @@ func FuzzQueuedRuntimeModel(f *testing.F) {
 		// Independent simulation over the same instruction stream.
 		simState := qState(0)
 		simCursor := 0
+		simExecuted := 0
+		var simTrace []qEvent
 		nextInstruction := func() qInstruction {
 			if simCursor >= len(program.instructions) {
 				return qInstruction{}
@@ -156,20 +165,21 @@ func FuzzQueuedRuntimeModel(f *testing.F) {
 			wantErr := false
 			canceled := false
 			pending := []qEvent{rootEvent}
+			accepted := 1
 			for len(pending) != 0 {
-				event := pending[0]
-				pending = pending[1:]
 				if canceled {
 					break
 				}
+				event := pending[0]
+				pending = pending[1:]
+				simExecuted++
+				simTrace = append(simTrace, event)
 				instruction := nextInstruction()
 				if instruction.cancel {
 					canceled = true // observed before the next event begins
 				}
-				enqueued := instruction.enqueue
-				if len(pending)+1+len(enqueued) > queued.DefaultMaxRunEvents {
-					enqueued = nil
-				}
+				enqueued := instruction.enqueue[:min(len(instruction.enqueue), queued.DefaultMaxRunEvents-accepted)]
+				accepted += len(enqueued)
 				if instruction.fail {
 					wantErr = true
 					break
@@ -185,33 +195,31 @@ func FuzzQueuedRuntimeModel(f *testing.F) {
 					state, program.runtime.State(), simState, rootEvent, program.instructions)
 			}
 			switch {
-			case wantErr && !canceled:
+			case wantErr:
 				if !errors.Is(err, errQueuedEffect) {
 					t.Fatalf("cascade error = %v, want effect failure", err)
 				}
-			case canceled:
-				if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errQueuedEffect) {
-					t.Fatalf("canceled cascade error = %v", err)
+			case canceled && len(pending) != 0:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("canceled cascade error = %v, want context.Canceled", err)
 				}
 			default:
 				if err != nil {
 					t.Fatalf("cascade = %v", err)
 				}
 			}
-			// Keep the model's instruction cursor aligned with reality: the
-			// library consumed exactly one instruction per executed event.
 			program.mu.Lock()
-			simCursor = program.cursor
-			program.violations = append(program.violations[:0:0], program.violations...)
-			violations := program.violations
+			trace := slices.Clone(program.trace)
+			executed, cursor := program.executed, program.cursor
+			violations := slices.Clone(program.violations)
 			program.mu.Unlock()
+			if !slices.Equal(trace, simTrace) || executed != simExecuted || cursor != simCursor {
+				t.Fatalf("execution trace=%v count=%d cursor=%d; model trace=%v count=%d cursor=%d",
+					trace, executed, cursor, simTrace, simExecuted, simCursor)
+			}
 			if len(violations) != 0 {
 				t.Fatalf("violations: %v", violations)
 			}
-			// Re-derive the simulated state from the committed one so a
-			// cancellation race (observed before or after one more event)
-			// cannot desynchronize the model.
-			simState = program.runtime.State()
 		}
 	})
 }

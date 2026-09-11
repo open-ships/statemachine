@@ -814,6 +814,9 @@ func (s *Supervisor[S, E, T]) closeJournal(op *activeOperation[S, E]) {
 
 // Verify completes an issued Change using fresh application data. Verify,
 // Invariants, and Postconditions must all succeed before logical commit.
+// An expired pending Attempt faults without running Verify, retains its
+// original Change and known Issue completion, and excludes recovery through
+// publication and any outstanding Journal or Recorder callback.
 func (s *Supervisor[S, E, T]) Verify(ctx context.Context, attempt AttemptID, data T) (Result[S, E], error) {
 	result := s.verify(ctx, attempt, data)
 	return result, result.Err
@@ -876,15 +879,12 @@ func (s *Supervisor[S, E, T]) verifyDecision(ctx context.Context, attempt Attemp
 		return base
 	}
 	if !s.clock.Now().Before(s.pending.deadline) {
-		change := s.pending.change
-		fault, cancel, fresh := s.latchLocked(nil, change, PhaseVerify, ErrVerificationTimeout, true)
-		base.stamp = s.stampLocked()
-		base.stamp.durable = fresh
+		result, cancel := s.expireVerificationLocked()
 		s.mu.Unlock()
 		if cancel != nil {
 			cancel()
 		}
-		return s.faultResult(base, fault)
+		return result
 	}
 	if s.countersExhaustedLocked() {
 		change := s.pending.change
@@ -1409,6 +1409,19 @@ func (s *Supervisor[S, E, T]) verificationExpired(attempt, timerVersion uint64) 
 		s.mu.Unlock()
 		return
 	}
+	result, cancel := s.expireVerificationLocked()
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	s.finalize(RecordVerificationExpired, result)
+}
+
+// expireVerificationLocked owns the complete publication lifetime regardless
+// of whether Verify or a timer detected expiry. The caller holds mu and must
+// finalize the result after unlocking. Any existing Operation retains its own
+// public-call ownership; expiry only borrows it to account for callbacks.
+func (s *Supervisor[S, E, T]) expireVerificationLocked() (Result[S, E], context.CancelFunc) {
 	change := s.pending.change
 	fault, cancel, fresh := s.latchLocked(nil, change, PhaseVerify, ErrVerificationTimeout, true)
 	result := resultFromChange(change)
@@ -1419,16 +1432,11 @@ func (s *Supervisor[S, E, T]) verificationExpired(attempt, timerVersion uint64) 
 	result.Err = fault
 	result.stamp = s.stampLocked()
 	result.stamp.durable = fresh
+	result.StartedAt = result.stamp.at
 	s.reporting++
 	result.owner = s.operation
-	s.mu.Unlock()
-	defer s.reportingReturned()
-	if cancel != nil {
-		cancel()
-	}
-	s.completeResult(&result)
-	s.closeJournalAfter(result)
-	s.recordResult(RecordVerificationExpired, result)
+	result.reporting = true
+	return result, cancel
 }
 
 func (s *Supervisor[S, E, T]) commit(

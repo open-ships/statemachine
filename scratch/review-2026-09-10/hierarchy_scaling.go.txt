@@ -1,0 +1,28 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+	"github.com/open-ships/statemachine/statechart"
+)
+
+func main() {
+	for _, depth := range []int{1000, 2000, 4000, 8000} {
+		d := statechart.Definition[int, int, struct{}]{}
+		for i:=0; i<depth; i++ {
+			d.States=append(d.States,statechart.State[int,int,struct{}]{Name:i})
+			d.Transitions=append(d.Transitions,statechart.Transition[int,int,struct{}]{From:i, Event:i, To:i, Kind:statechart.Internal})
+			if i>0 {d.Substates=append(d.Substates,statechart.Substate[int]{Child:i,Parent:i-1})}
+		}
+		chart:=statechart.MustCompile(d)
+		instance,_:=chart.New(depth-1)
+		started:=time.Now()
+		count:=0
+		for range 3 {for range instance.Permitted(context.Background(),struct{}{}) {count++}}
+		permitted:=time.Since(started)/3
+		started=time.Now()
+		for range 3 {for range chart.Arrows(depth-1) {count++}}
+		fmt.Printf("depth=%d permitted=%s arrows=%s count=%d\n",depth,permitted,time.Since(started)/3,count)
+	}
+}

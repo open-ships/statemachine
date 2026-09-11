@@ -1,0 +1,6 @@
+--- FAIL: FuzzQueuedRuntimeModel (0.00s)
+    --- FAIL: FuzzQueuedRuntimeModel/seed#1 (0.00s)
+        fuzz_test.go:214: execution trace=[0 2 1 0] count=4 cursor=4; model trace=[0 0 1 2] count=4 cursor=4
+FAIL
+FAIL	github.com/open-ships/statemachine/queued	2.038s
+FAIL

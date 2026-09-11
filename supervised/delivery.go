@@ -29,13 +29,16 @@ func (s *Supervisor[S, E, T]) reportingReturned() {
 // finalize owns every callback started by an admitted public operation. Private
 // test entry points call it too, so tests cross the same protocol as callers.
 func (s *Supervisor[S, E, T]) finalize(kind RecordKind, result Result[S, E]) Result[S, E] {
-	if result.owner != nil {
+	if result.reporting {
+		defer s.reportingReturned()
+	} else if result.owner != nil {
 		defer s.operationReturned(result.owner)
 	}
 	s.completeResult(&result)
 	s.closeJournalAfter(result)
 	s.recordResult(kind, result)
 	result.owner = nil
+	result.reporting = false
 	return result
 }
 

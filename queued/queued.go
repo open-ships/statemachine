@@ -442,25 +442,25 @@ func (r *Runtime[S, E, T]) drain() {
 }
 
 // execute isolates a root so runtime.Goexit in user code cannot terminate the
-// queue's drain goroutine. The deferred send is the Goexit path: ordinary
-// returns set returned first and send the more specific outcome from run.
+// queue's drain goroutine. run updates the shared outcome even while unwinding,
+// so the deferred send preserves failures from previously committed Steps.
 func (r *Runtime[S, E, T]) execute(req *root[E, T, S]) outcome[S] {
 	done := make(chan outcome[S], 1)
 	go func() {
-		returned := false
-		defer func() {
-			if !returned {
-				done <- outcome[S]{state: r.State(), err: ErrExecutionStopped}
-			}
-		}()
-		result := r.run(req)
-		returned = true
-		done <- result
+		var result outcome[S]
+		defer func() { done <- result }()
+		r.run(req, &result)
 	}()
 	return <-done
 }
 
-func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
+func (r *Runtime[S, E, T]) run(req *root[E, T, S], result *outcome[S]) {
+	var observerFailures []error
+	defer func() {
+		if len(observerFailures) != 0 {
+			result.err = errors.Join(result.err, errors.Join(observerFailures...))
+		}
+	}()
 	c := &cascade[E, T]{active: true, accepted: 1, maximum: r.limits.MaxRunEvents}
 	var run uint64
 	x := &execution{owner: r, active: c.isActive}
@@ -484,14 +484,14 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 			return
 		}
 		c.abort()
-		result = outcome[S]{state: r.State(), err: ErrExecutionStopped}
+		*result = outcome[S]{state: r.State(), err: ErrExecutionStopped}
 		if recovered != nil {
 			stack := make([]byte, 64<<10)
 			stack = stack[:goruntime.Stack(stack, false)]
 			r.mu.Lock()
 			r.lastPanic = &PanicInfo[E]{Event: current.event, At: time.Now(), Stack: string(stack)}
 			r.mu.Unlock()
-			result = outcome[S]{
+			*result = outcome[S]{
 				state:      r.State(),
 				panicked:   true,
 				panicValue: recovered,
@@ -501,17 +501,16 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 
 	execCtx := context.WithValue(req.ctx, executionKey{}, x)
 	current = item[E, T]{ctx: execCtx, event: req.event, data: req.data}
-	var observerFailures []error
 
 	for {
 		if err := req.ctx.Err(); err != nil {
 			c.abort()
-			result = outcome[S]{state: r.State(), err: err}
+			*result = outcome[S]{state: r.State(), err: err}
 			break
 		}
 		if err := current.ctx.Err(); err != nil {
 			c.abort()
-			result = outcome[S]{state: r.State(), err: err}
+			*result = outcome[S]{state: r.State(), err: err}
 			break
 		}
 
@@ -519,7 +518,7 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 		to, err := r.instance.Fire(current.ctx, current.event, current.data)
 		if err != nil {
 			c.abort()
-			result = outcome[S]{state: r.State(), err: err}
+			*result = outcome[S]{state: r.State(), err: err}
 			break
 		}
 
@@ -548,13 +547,9 @@ func (r *Runtime[S, E, T]) run(req *root[E, T, S]) (result outcome[S]) {
 		var ok bool
 		current, ok = c.next()
 		if !ok {
-			result = outcome[S]{state: to}
+			*result = outcome[S]{state: to}
 			break
 		}
 	}
-	if len(observerFailures) != 0 {
-		result.err = errors.Join(result.err, errors.Join(observerFailures...))
-	}
 	completed = true
-	return result
 }
