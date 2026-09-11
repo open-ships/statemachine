@@ -1,0 +1,6 @@
+--- FAIL: FuzzQueuedRuntimeModel (0.00s)
+    --- FAIL: FuzzQueuedRuntimeModel/seed#1 (0.00s)
+        fuzz_test.go:191: state = 2/2, model 1 (root 0, instructions [{fail:false enqueue:[0 1 2] cancel:false reentrant:false} {fail:false enqueue:[] cancel:false reentrant:false} {fail:false enqueue:[] cancel:false reentrant:false} {fail:false enqueue:[] cancel:false reentrant:false}])
+FAIL
+FAIL	github.com/open-ships/statemachine/queued	1.219s
+FAIL

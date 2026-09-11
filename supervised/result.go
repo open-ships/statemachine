@@ -313,6 +313,9 @@ type Result[S, E comparable] struct {
 	// lifecycle Record, never part of the public outcome.
 	stamp recordStamp
 	owner *activeOperation[S, E]
+	// reporting owns publication without owning the enclosing Operation call.
+	// Timer expiry may borrow an Issue's owner for callback accounting.
+	reporting bool
 }
 
 // Fault is an outward snapshot of the immutable first cause retained privately

@@ -1,0 +1,13 @@
+go version go1.26.8 darwin/arm64
+ok  	github.com/open-ships/statemachine	(cached)	coverage: 99.2% of statements
+ok  	github.com/open-ships/statemachine/internal/keycheck	(cached)	coverage: 100.0% of statements
+ok  	github.com/open-ships/statemachine/internal/observer	(cached)	coverage: 20.8% of statements
+ok  	github.com/open-ships/statemachine/persist	(cached)	coverage: 97.0% of statements
+ok  	github.com/open-ships/statemachine/persist/persisttest	(cached)	coverage: 82.1% of statements
+ok  	github.com/open-ships/statemachine/queued	1.289s	coverage: 96.7% of statements
+ok  	github.com/open-ships/statemachine/statechart	(cached)	coverage: 96.9% of statements
+ok  	github.com/open-ships/statemachine/supervised	1.571s	coverage: 91.0% of statements
+Statement coverage: 90.8% (minimum 90%)
+No vulnerabilities found.
+ok  	github.com/open-ships/statemachine/integration/sqlite	(cached)
+No vulnerabilities found.

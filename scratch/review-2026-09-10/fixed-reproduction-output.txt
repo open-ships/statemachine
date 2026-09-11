@@ -1,0 +1,11 @@
+=== RUN   TestReviewExpiredVerifyOwnsPublication
+    review_20260910_test.go:42: unpublished expiry: operation=false reporting=true
+--- PASS: TestReviewExpiredVerifyOwnsPublication (0.00s)
+=== RUN   TestReviewExpiredVerifyPreservesChange
+--- PASS: TestReviewExpiredVerifyPreservesChange (0.00s)
+PASS
+ok  	github.com/open-ships/statemachine/supervised	1.524s
+=== RUN   TestReviewObserverFailureSurvivesLaterGoexit
+--- PASS: TestReviewObserverFailureSurvivesLaterGoexit (0.00s)
+PASS
+ok  	github.com/open-ships/statemachine/queued	1.275s
